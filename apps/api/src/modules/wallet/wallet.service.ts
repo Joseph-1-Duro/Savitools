@@ -1,97 +1,55 @@
-import { Injectable, BadRequestException, Logger } from '@nestjs/common';
-import { Keypair, TransactionBuilder, BASE_FEE, Networks, Operation, Asset } from '@stellar/stellar-sdk';
-import * as StellarSdk from '@stellar/stellar-sdk';
+import { Injectable } from '@nestjs/common';
+import {
+  StellarTestnetService,
+  type Balance,
+} from '../stellar/stellar-testnet.service';
 
-export interface Balance {
-  assetType: string;
-  assetCode: string | null;
-  assetIssuer: string | null;
-  balance: string;
-  limit?: string;
-}
+export type { Balance };
 
+/**
+ * Testnet wallet behind the Wallet page.
+ *
+ * The Stellar mechanics live in StellarTestnetService so this module and the
+ * sandbox cannot drift apart. What stays here is the response shape the Wallet
+ * page renders.
+ */
 @Injectable()
 export class WalletService {
-  private readonly logger = new Logger(WalletService.name);
+  constructor(
+    private readonly stellar: StellarTestnetService = new StellarTestnetService(),
+  ) {}
 
-  private readonly server = new StellarSdk.Horizon.Server('https://horizon-testnet.stellar.org');
-  private readonly friendbotUrl = 'https://friendbot.stellar.org';
+  /** Horizon client shared with the sandbox. */
+  private get server() {
+    return this.stellar.server;
+  }
 
   generateKeypair() {
-    const keypair = Keypair.random();
-    const secretKey = keypair.secret();
-    const publicKey = keypair.publicKey();
-
-    // Securely overwrite the secret buffer if available or overwrite via Node buffer techniques
-    try {
-      const rawBuffer = keypair.rawSecret();
-      if (rawBuffer && Buffer.isBuffer(rawBuffer)) {
-        rawBuffer.fill(0);
-      }
-    } catch {
-      // Fallback if rawSecret is unavailable
-    }
-
-    return {
-      publicKey,
-      secretKey,
-    };
+    return this.stellar.generateKeypair();
   }
 
   async fundFromFriendbot(publicKey: string) {
-    const url = `${this.friendbotUrl}?addr=${encodeURIComponent(publicKey)}`;
+    const reply = await this.stellar.requestFriendbotFunding(publicKey);
 
-    let response: Response;
-    try {
-      response = await fetch(url, { signal: AbortSignal.timeout(30000) });
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'Unknown error';
-      this.logger.error(`Friendbot request failed for ${publicKey}: ${message}`);
-      throw new BadRequestException(`Friendbot request failed: ${message}`);
+    if (!reply.ok) {
+      throw this.stellar.friendbotFailure(reply);
     }
-
-    if (!response.ok) {
-      const body = await response.text().catch(() => '');
-      this.logger.error(`Friendbot error for ${publicKey}: ${response.status} ${body}`);
-      throw new BadRequestException(
-        `Friendbot funding failed (${response.status}): ${body || response.statusText}`,
-      );
-    }
-
-    const json: any = await response.json().catch(() => ({}));
 
     return {
       publicKey,
       funded: true,
-      txHash: json.hash ?? null,
+      txHash: reply.hash,
       startingBalance: '10,000 XLM',
     };
   }
 
   async getBalances(publicKey: string) {
-    let account: any;
-    try {
-      account = await this.server.loadAccount(publicKey);
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'Unknown error';
-      this.logger.error(`Failed to load account ${publicKey}: ${message}`);
-      if (message.includes('not found') || message.includes('404')) {
-        throw new BadRequestException(
-          `Account ${publicKey} not found on testnet. Fund it via Friendbot first.`,
-        );
-      }
-      throw new BadRequestException(`Failed to load account: ${message}`);
-    }
+    const account = await this.stellar.loadAccount(publicKey);
 
-    const balances: Balance[] = account.balances.map((b: any) => ({
-      assetType: b.asset_type,
-      assetCode: b.asset_code ?? null,
-      assetIssuer: b.asset_issuer ?? null,
-      balance: b.balance,
-      limit: b.limit ?? undefined,
-    }));
-
-    return { publicKey, balances };
+    return {
+      publicKey,
+      balances: this.stellar.mapBalances(account),
+    };
   }
 
   async sendPayment(
@@ -100,74 +58,12 @@ export class WalletService {
     assetString: string,
     amount: string,
   ) {
-    let sourceKeypair: Keypair;
-    try {
-      sourceKeypair = Keypair.fromSecret(sourceSecret);
-    } catch {
-      throw new BadRequestException('Invalid source secret key');
-    }
-
-    const sourcePublicKey = sourceKeypair.publicKey();
-
-    if (!destination || destination.length < 56) {
-      throw new BadRequestException('Invalid destination public key');
-    }
-
-    const parsedAmount = parseFloat(amount);
-    if (isNaN(parsedAmount) || parsedAmount <= 0) {
-      throw new BadRequestException('Amount must be a positive number');
-    }
-
-    let paymentAsset: Asset;
-    if (assetString === 'XLM') {
-      paymentAsset = Asset.native();
-    } else {
-      const parts = assetString.split(':');
-      if (parts.length !== 2 || !parts[0] || !parts[1]) {
-        throw new BadRequestException(
-          `Invalid asset format: "${assetString}". Use "XLM" or "CODE:ISSUER"`,
-        );
-      }
-      paymentAsset = new Asset(parts[0], parts[1]);
-    }
-
-    let sourceAccount: any;
-    try {
-      sourceAccount = await this.server.loadAccount(sourcePublicKey);
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'Unknown error';
-      this.logger.error(`Failed to load source account ${sourcePublicKey}: ${message}`);
-      throw new BadRequestException(`Failed to load source account: ${message}`);
-    }
-
-    let tx: StellarSdk.Transaction;
-    try {
-      tx = new TransactionBuilder(sourceAccount, {
-        fee: BASE_FEE,
-        networkPassphrase: Networks.TESTNET,
-      })
-        .addOperation(Operation.payment({
-          destination,
-          asset: paymentAsset,
-          amount,
-        }))
-        .setTimeout(30)
-        .build();
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'Unknown error';
-      throw new BadRequestException(`Failed to build transaction: ${message}`);
-    }
-
-    tx.sign(sourceKeypair);
-
-    let result: any;
-    try {
-      result = await this.server.submitTransaction(tx);
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'Unknown error';
-      this.logger.error(`Transaction submission failed: ${message}`);
-      throw new BadRequestException(`Payment failed: ${message}`);
-    }
+    const result = await this.stellar.submitPayment({
+      sourceSecret,
+      destination,
+      asset: assetString,
+      amount,
+    });
 
     return {
       success: true,

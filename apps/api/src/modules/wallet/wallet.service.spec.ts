@@ -34,27 +34,21 @@ describe('WalletService', () => {
     it('zeros raw secret key buffer on keypair generation', () => {
       const { Keypair } = require('@stellar/stellar-sdk');
       const originalRandom = Keypair.random;
-      
-      let capturedRawSecret: Buffer | null = null;
+      const raw = Buffer.alloc(32, 1);
+
       Keypair.random = () => {
-        const kp = originalRandom();
-        try {
-          capturedRawSecret = kp.rawSecret();
-        } catch {
-          capturedRawSecret = Buffer.alloc(32, 1);
-          kp.rawSecret = () => capturedRawSecret;
-        }
+        const kp = originalRandom.call(Keypair);
+        kp.rawSecretKey = () => raw;
         return kp;
       };
 
       try {
         service.generateKeypair();
-        if (capturedRawSecret) {
-          expect([...capturedRawSecret]).toEqual(new Array(capturedRawSecret.length).fill(0));
-        }
       } finally {
         Keypair.random = originalRandom;
       }
+
+      expect([...raw]).toEqual(new Array(raw.length).fill(0));
     });
   });
 

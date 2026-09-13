@@ -12,6 +12,7 @@ import { MonitorModule } from "./modules/monitor/monitor.module";
 import { SdkgenModule } from "./modules/sdkgen/sdkgen.module";
 import { ContractsModule } from "./modules/contracts/contracts.module";
 import { NetworkModule } from "./modules/network/network.module";
+import { StellarTestnetModule } from "./modules/stellar/stellar-testnet.module";
 import { WalletModule } from "./modules/wallet/wallet.module";
 import { SimulatorModule } from "./modules/simulator/simulator.module";
 import { WebhookModule } from "./modules/webhook/webhook.module";
@@ -67,6 +68,7 @@ ThrottlerModule.forRootAsync({
     }),
 
     AuthModule,
+    StellarTestnetModule,
     PlaygroundModule,
     WorkspaceModule,
     MonitorModule,
