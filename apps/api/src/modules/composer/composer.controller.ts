@@ -15,40 +15,48 @@ export class ComposerController {
     private readonly transactionSequenceService: TransactionSequenceService,
   ) {}
 
+  @Get('operations')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'List supported operation types and their fields' })
+  @ApiResponse({ status: 200, description: 'Operation manifest' })
+  getOperations() {
+    return this.composerService.getOperations();
+  }
+
   @Post('build')
-  \n  @ApiOperation({ summary: 'Build and sign a Stellar transaction XDR' })
+  @ApiOperation({ summary: 'Build an unsigned Stellar transaction XDR' })
   @ApiResponse({ status: 201, description: 'Transaction built successfully' })
-  async buildTransaction(@body() dto: BuildTransactionDto) {
+  async buildTransaction(@Body() dto: BuildTransactionDto) {
     return this.composerService.buildTransaction(dto);
   }
 
   @Post('simulate')
   @HttpCode(HttpStatus.OK)
-  \n  @ApiOperation({ summary: 'Simulate a transaction envelope via Horizon' })
+  @ApiOperation({ summary: 'Simulate a transaction envelope via Horizon' })
   @ApiResponse({ status: 200, description: 'Simulation completed' })
-  async simulateTransaction(@body() dto: SimulateTransactionDto) {
+  async simulateTransaction(@Body() dto: SimulateTransactionDto) {
     return this.composerService.simulateTransaction(dto);
   }
 
   @Post('benchmark')
   @HttpCode(HttpStatus.OK)
-  \n  @ApiOperation({ summary: 'Run sequential and concurrent transaction submission benchmarks' })
+  @ApiOperation({ summary: 'Run sequential and concurrent transaction submission benchmarks' })
   @ApiResponse({ status: 200, description: 'Benchmark completed' })
-  async benchmarkTransaction(@body() dto: BenchmarkTransactionDto) {
+  async benchmarkTransaction(@Body() dto: BenchmarkTransactionDto) {
     return this.composerService.benchmarkTransaction(dto);
   }
 
   @Post('sequence/run')
   @HttpCode(HttpStatus.OK)
-  \n  @ApiOperation({ summary: 'Run a transaction sequence with automatic sequence numbers' })
+  @ApiOperation({ summary: 'Run a transaction sequence with automatic sequence numbers' })
   @ApiResponse({ status: 200, description: 'Sequence executed' })
-  async runTransactionSequence(@body() dto: RunTransactionSequenceDto) {
+  async runTransactionSequence(@Body() dto: RunTransactionSequenceDto) {
     return this.transactionSequenceService.run(dto);
   }
 
   @Get('sequence')
   @HttpCode(HttpStatus.OK)
-  \n  @ApiOperation({ summary: 'List transaction sequence runs' })
+  @ApiOperation({ summary: 'List transaction sequence runs' })
   @ApiResponse({ status: 200, description: 'Sequence history' })
   async listTransactionSequences() {
     return this.transactionSequenceService.list();

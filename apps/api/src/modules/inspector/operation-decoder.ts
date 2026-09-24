@@ -1,4 +1,5 @@
 import type { Operation } from '@stellar/stellar-sdk';
+import { StrKey } from '@stellar/stellar-sdk';
 import { decodeScVal } from '../contracts/scval-decoder';
 
 export interface DecodedOperation {
@@ -224,7 +225,25 @@ export function decodeOperation(op: any): DecodedOperation {
               if (typeof invoke.contractAddress === 'function') {
                 try {
                   const addr = invoke.contractAddress();
-                  contractId = addr ? addr.toString() : null;
+                  if (addr && typeof addr.switch === 'function') {
+                    const addrSwitch = addr.switch();
+                    const addrSwitchName =
+                      typeof addrSwitch.name === 'string' ? addrSwitch.name : String(addrSwitch);
+                    if (addrSwitchName === 'scAddressTypeContract') {
+                      const hash = addr.contractId ? addr.contractId() : null;
+                      if (hash) {
+                        contractId = StrKey.encodeContract(hash);
+                      } else {
+                        contractId = addr.toString();
+                      }
+                    } else if (addrSwitchName === 'scAddressTypeAccount' && addr.accountId) {
+                      contractId = addr.accountId().accountId().toString('hex');
+                    } else {
+                      contractId = addr.toString();
+                    }
+                  } else {
+                    contractId = addr ? addr.toString() : null;
+                  }
                 } catch {
                   // ignore
                 }

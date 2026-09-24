@@ -211,6 +211,8 @@ export class ContractsController {
     }
 
     throw new BadRequestException('Invalid wizard step');
+  }
+
   @Post('wasm/upload')
   @ApiCookieAuth()
   @UseGuards(JwtAuthGuard, ContractAuthorizationGuard)

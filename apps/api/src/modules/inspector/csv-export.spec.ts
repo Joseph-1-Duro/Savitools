@@ -45,6 +45,7 @@ function sampleBreakdown(): TransactionBreakdown {
     ],
     rawJson: null,
     network: 'testnet',
+    sorobanEvents: [],
     composerPayload: null,
   };
 }

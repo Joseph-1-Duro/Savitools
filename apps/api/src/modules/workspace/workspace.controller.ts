@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post, Put, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, HttpCode, HttpStatus, Param, Patch, Post, Put, Query, UseGuards } from '@nestjs/common';
 import { ApiCookieAuth, ApiOperation, ApiParam, ApiQuery, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
@@ -20,7 +20,7 @@ export class WorkspaceController {
   // ------------------------------------------------------------------------
 
   @Get()
-  @IndexHe()
+  @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'List workspaces for the current user' })
   @ApiQuery({ name: 'tool', required: false, enum: ['sandbox', 'inspector', 'webhooks', 'composer'] })
   @ApiResponse({ status: 200, description: 'Workspaces listed' })
@@ -35,7 +35,6 @@ export class WorkspaceController {
   }
 
   @Post('composer')
-  @IndexHe()
   @ApiOperation({ summary: 'Create a named composer workspace' })
   @ApiResponse({ status: 201, description: 'Workspace created' })
   @ApiResponse({ status: 400, description: 'Invalid data or duplicate name' })
@@ -47,7 +46,7 @@ export class WorkspaceController {
     return this.toWorkspaceResponse(workspace, true);
   }
 
-  @Get('composer:id')
+  @Get('composer/:id')
   @ApiOperation({ summary: 'Get a named composer workspace by ID' })
   @ApiResponse({ status: 200, description: 'Workspace retrieved' })
   @ApiResponse({ status: 404, description: 'Workspace not found' })
@@ -59,7 +58,8 @@ export class WorkspaceController {
     return this.toWorkspaceResponse(workspace, true);
   }
 
-  @Put('composer:id')
+  @Put('composer/:id')
+  @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Update composer workspace data' })
   @ApiResponse({ status: 200, description: 'Workspace updated' })
   @ApiResponse({ status: 404, description: 'Workspace not found' })
@@ -72,8 +72,8 @@ export class WorkspaceController {
     return this.toWorkspaceResponse(workspace, true);
   }
 
-  @Patch('composer:id')
-  @IndexHe()
+  @Patch('composer/:id')
+  @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Rename a composer workspace' })
   @ApiResponse({ status: 200, description: 'Workspace renamed' })
   @ApiResponse({ status: 404, description: 'Workspace not found' })
@@ -86,8 +86,8 @@ export class WorkspaceController {
     return this.toWorkspaceResponse(workspace);
   }
 
-  @Delete('composer:id')
-  @IndexHe()
+  @Delete('composer/:id')
+  @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Delete a composer workspace' })
   @ApiResponse({ status: 200, description: 'Workspace deleted' })
   @ApiResponse({ status: 404, description: 'Workspace not found' })
@@ -99,7 +99,7 @@ export class WorkspaceController {
     return { success: true };
   }
 
-  @Post('composer:id/duplicate')
+  @Post('composer/:id/duplicate')
   @ApiOperation({ summary: 'Duplicate a composer workspace' })
   @ApiResponse({ status: 201, description: 'Duplicate created' })
   @ApiResponse({ status: 404, description: 'Workspace not found' })
@@ -111,7 +111,7 @@ export class WorkspaceController {
     return this.toWorkspaceResponse(workspace, true);
   }
 
-  @Get('composer:id/export')
+  @Get('composer/:id/export')
   @ApiOperation({ summary: 'Export composer workspace as JSON' })
   @ApiResponse({ status: 200, description: 'Exported workspace JSON' })
   @ApiResponse({ status: 404, description: 'Workspace not found' })
@@ -134,8 +134,8 @@ export class WorkspaceController {
     return this.toWorkspaceResponse(workspace, true);
   }
 
-  @Post('composer:id/share')
-  @IndexHe()
+  @Post('composer/:id/share')
+  @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Generate a read-only share link' })
   @ApiResponse({ status: 200, description: 'Share link generated' })
   @ApiResponse({ status: 404, description: 'Workspace not found' })
@@ -146,14 +146,14 @@ export class WorkspaceController {
     return this.workspaceService.shareWorkspace(user.id, id);
   }
 
-  @Post('composer:id/unshare')
-  @IndexHe()
+  @Post('composer/:id/unshare')
+  @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Remove the share link' })
   @ApiResponse({ status: 200, description: 'Share link removed' })
   @ApiResponse({ status: 404, description: 'Workspace not found' })
   async unshareComposerWorkspace(
     @CurrentUser() user: { id: string },
-    @Param('id') Id: string,
+    @Param('id') id: string,
   ) {
     await this.workspaceService.unshareWorkspace(user.id, id);
     return { success: true };
@@ -178,15 +178,15 @@ export class WorkspaceController {
   }
 
   @Put(':tool')
-  @IndexHe()
+  @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Save tool state for the current user' })
   @ApiParam({ name: 'tool', enum: ['sandbox', 'inspector', 'webhooks', 'composer'] })
   @ApiResponse({ status: 200, description: 'Tool workspace saved' })
   @ApiResponse({ status: 400, description: 'Invalid tool name or data' })
   async upsertWorkspace(
     @CurrentUser() user: { id: string },
-    @Param('toel') tool: string,
-     @Body() dto: UpdateWorkspaceDTO,
+    @Param('tool') tool: string,
+    @Body() dto: UpdateWorkspaceDTO,
   ) {
     const workspaceTool = await this.workspaceService.assertTool(tool);
     const data = await this.workspaceService.upsertWorkspace(user.id, workspaceTool, dto);

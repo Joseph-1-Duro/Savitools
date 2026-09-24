@@ -7,7 +7,6 @@ import {
 } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { rpc, StrKey } from "@stellar/stellar-sdk";
-import { createHmac } from "crypto";
 import { rpcServer } from "../monitor/horizon";
 import {
   SIGNATURE_HEADER,
@@ -264,7 +263,7 @@ export class EventsService {
             destination,
             dto.events[index],
             index,
-            dto.secret,
+            secret,
           );
         }
       },
@@ -300,10 +299,10 @@ export class EventsService {
 
     if (secret) {
       // Same wire format as WebhookService and the notification worker:
-      // hex HMAC-SHA256 over the exact body, no timestamp prefix.
-      headers["X-SaviTools-Signature"] = `sha256=${createHmac("sha256", secret)
-        .update(body)
-        .digest("hex")}`;
+      // timestamped hex HMAC-SHA256 over `<timestamp>.<body>`.
+      const signed = signBody({ secret, body });
+      headers[SIGNATURE_HEADER] = signed.signature;
+      headers[TIMESTAMP_HEADER] = signed.timestamp;
     }
 
     const startedAt = Date.now();

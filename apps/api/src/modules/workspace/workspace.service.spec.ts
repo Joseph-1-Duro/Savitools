@@ -51,6 +51,7 @@ describe('WorkspaceService', () => {
         userId: 'user-1',
         tool: WorkspaceTool.COMPOSER,
         data: { layout: 'grid' },
+        name: null,
       });
       expect(repo.save).toHaveBeenCalled();
       expect(result).toEqual({ layout: 'grid' });

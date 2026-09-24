@@ -27,6 +27,14 @@ describe("NetworkService", () => {
         get: jest.fn((key: string, fallback?: string) => fallback),
       } as any,
       repository as any,
+      {
+        create: jest.fn(),
+        save: jest.fn(),
+        find: jest.fn(),
+        findOne: jest.fn(),
+        update: jest.fn(),
+        remove: jest.fn(),
+      } as any,
     );
   });
 
@@ -42,7 +50,7 @@ describe("NetworkService", () => {
         .spyOn(service, "fetchCurrentStatus")
         .mockImplementation(async (network) => ({
           timestamp: Date.now(),
-          network,
+          network: typeof network === "string" ? network : network.name,
           passphrase: "passphrase",
           ledger: {
             sequence: 1,
@@ -72,10 +80,12 @@ describe("NetworkService", () => {
       jest
         .spyOn(service, "fetchCurrentStatus")
         .mockImplementation(async (network) => {
-          if (network === "mainnet") throw new Error("mainnet down");
+          if (typeof network === "string" && network === "mainnet") {
+            throw new Error("mainnet down");
+          }
           return {
             timestamp: Date.now(),
-            network,
+            network: typeof network === "string" ? network : network.name,
             passphrase: "passphrase",
             ledger: {
               sequence: 1,

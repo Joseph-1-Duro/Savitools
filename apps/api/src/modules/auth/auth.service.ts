@@ -21,7 +21,7 @@ import {
 } from '@simplewebauthn/server';
 import type {
   AuthenticationResponseJSON,
-  AuthenticatorTransportFuture,
+  AuthenticatorTransport,
   PublicKeyCredentialCreationOptionsJSON,
   PublicKeyCredentialRequestOptionsJSON,
   RegistrationResponseJSON,
@@ -806,7 +806,7 @@ export class AuthService {
       attestationType: 'none',
       excludeCredentials: existing.map((c) => ({
         id: c.credentialId,
-        transports: (c.transports ?? []) as AuthenticatorTransportFuture[],
+        transports: (c.transports ?? []) as AuthenticatorTransport[],
       })),
     });
 
@@ -884,7 +884,7 @@ export class AuthService {
       userId,
       name,
       credentialId: credential.id,
-      algorithm: credential.algorithm,
+      algorithm: (credential as { algorithm?: number }).algorithm ?? -7,
       publicKey: Buffer.from(credential.publicKey).toString('base64url'),
       counter: 0,
       transports: transports ?? credential.transports ?? null,
@@ -918,7 +918,7 @@ export class AuthService {
       }
     }
 
-    const authOptions = generateAuthenticationOptions({
+    const authOptions = await generateAuthenticationOptions({
       rpID: rpId,
       allowCredentials,
       userVerification: 'preferred',
@@ -1004,8 +1004,10 @@ export class AuthService {
     };
 
     // Consume the challenge before verification so replays never verify.
+    const clientChallenge =
+      (assertionResponse.response as { challenge?: string }).challenge ?? '';
     this.claimAssertionChallenge(
-      assertionResponse.response.challenge ?? '',
+      clientChallenge,
       credentialId,
       credential.userId,
       rpId,
@@ -1013,16 +1015,16 @@ export class AuthService {
 
     let verification;
     try {
-      verification = verifyAuthenticationResponse({
+      verification = await verifyAuthenticationResponse({
         response: assertionResponse,
-        expectedChallenge: assertionResponse.response.challenge ?? '',
+        expectedChallenge: clientChallenge,
         expectedOrigin: origin,
         expectedRPID: rpId,
         credential: {
           id: credential.credentialId,
           publicKey: Buffer.from(credential.publicKey, 'base64url'),
           counter: Number(credential.counter),
-          transports: (credential.transports ?? []) as AuthenticatorTransportFuture[],
+          transports: (credential.transports ?? []) as AuthenticatorTransport[],
         },
         requireUserVerification: false,
       });
@@ -1032,19 +1034,20 @@ export class AuthService {
       );
     }
 
-    if (!verification.valid) {
+    if (!verification.verified) {
       throw new UnauthorizedException('PASSKEY_ASSERTION_INVALID');
     }
 
+    const authInfo = verification.authenticationInfo;
     if (
-      typeof verification.authenticationInfo.newCounter === 'number' &&
-      verification.authenticationInfo.newCounter !== 0 &&
-      verification.authenticationInfo.newCounter <= Number(credential.counter)
+      typeof authInfo.newCounter === 'number' &&
+      authInfo.newCounter !== 0 &&
+      authInfo.newCounter <= Number(credential.counter)
     ) {
       throw new UnauthorizedException('PASSKEY_REPLAY_OR_CLONE_DETECTED');
     }
 
-    credential.counter = verification.authenticationInfo.newCounter;
+    credential.counter = authInfo.newCounter;
     credential.lastUsedAt = new Date();
     await this.passkeysRepository.save(credential);
 

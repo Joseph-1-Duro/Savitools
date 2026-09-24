@@ -5,8 +5,11 @@ jest.mock('redis', () => {
     lPush: jest.fn(),
     lTrim: jest.fn(),
     lRange: jest.fn(),
-    sAdd: jest.fn(),
-    sMembers: jest.fn(),
+    zAdd: jest.fn(),
+    zCard: jest.fn().mockResolvedValue(0),
+    zRemRangeByRank: jest.fn(),
+    zRemRangeByScore: jest.fn(),
+    zRange: jest.fn().mockResolvedValue([]),
     on: jest.fn(),
   };
   return {
@@ -52,7 +55,7 @@ describe('OrderbookService', () => {
   describe('getOrderbook', () => {
     it('computes spread, mid price, and cumulative levels from Horizon', async () => {
       (service as any).redisClient = mockRedisClient;
-      mockRedisClient.sAdd.mockResolvedValue(undefined);
+      mockRedisClient.zAdd.mockResolvedValue(undefined);
       global.fetch = jest.fn().mockResolvedValue({
         ok: true,
         json: async () => horizonOrderBookResponse(),
@@ -84,15 +87,19 @@ describe('OrderbookService', () => {
       expect(result.asks[1].cumulativeAmount).toBe('450.0000000');
       expect(result.asks[2].cumulativeAmount).toBe('470.0000000');
 
-      expect(mockRedisClient.sAdd).toHaveBeenCalledWith(
+      expect(mockRedisClient.zAdd).toHaveBeenCalledWith(
         'orderbook:active_pairs:testnet',
-        'XLM|USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHT3VM35KCEIWI6VH5XY4O2Y5JV3CJQ',
+        [
+          expect.objectContaining({
+            value: expect.stringContaining('native|USDC'),
+          }),
+        ],
       );
     });
 
     it('gives a low liquidity score for a thin book', async () => {
       (service as any).redisClient = mockRedisClient;
-      mockRedisClient.sAdd.mockResolvedValue(undefined);
+      mockRedisClient.zAdd.mockResolvedValue(undefined);
       global.fetch = jest.fn().mockResolvedValue({
         ok: true,
         json: async () => ({
@@ -110,7 +117,7 @@ describe('OrderbookService', () => {
 
     it('gives a high liquidity score for a deep, tight book', async () => {
       (service as any).redisClient = mockRedisClient;
-      mockRedisClient.sAdd.mockResolvedValue(undefined);
+      mockRedisClient.zAdd.mockResolvedValue(undefined);
       global.fetch = jest.fn().mockResolvedValue({
         ok: true,
         json: async () => ({
@@ -172,8 +179,9 @@ describe('OrderbookService', () => {
   describe('onModuleInit / onModuleDestroy', () => {
     it('connects to Redis, seeds the default pair, and polls', async () => {
       mockRedisClient.connect.mockResolvedValue(undefined);
-      mockRedisClient.sAdd.mockResolvedValue(undefined);
-      mockRedisClient.sMembers.mockResolvedValue([
+      mockRedisClient.zAdd.mockResolvedValue(undefined);
+      mockRedisClient.zCard.mockResolvedValue(1);
+      mockRedisClient.zRange.mockResolvedValue([
         'XLM|USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHT3VM35KCEIWI6VH5XY4O2Y5JV3CJQ',
       ]);
       mockRedisClient.lPush.mockResolvedValue(undefined);
@@ -186,7 +194,7 @@ describe('OrderbookService', () => {
       await service.onModuleInit();
 
       expect(mockRedisClient.connect).toHaveBeenCalled();
-      expect(mockRedisClient.sAdd).toHaveBeenCalled();
+      expect(mockRedisClient.zAdd).toHaveBeenCalled();
       expect(mockRedisClient.lPush).toHaveBeenCalled();
     });
 
