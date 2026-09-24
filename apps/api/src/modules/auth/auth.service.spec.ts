@@ -719,4 +719,136 @@ describe('AuthService', () => {
       expect(result).toEqual({ id: 'user-1' });
     });
   });
+
+  // ─── Password reset (Savitura/Savitools#196) ───────────────────────────────
+
+  describe('password reset', () => {
+    const GENERIC =
+      'If an account with that email exists, we have sent a link to reset your password.';
+
+    it('returns the same generic message for unknown accounts (enumeration resistance)', async () => {
+      usersRepo.findOne.mockResolvedValue(null);
+
+      const result = await service.requestPasswordReset('nobody@example.com');
+
+      expect(result.message).toBe(GENERIC);
+      expect(usersRepo.save).not.toHaveBeenCalled();
+    });
+
+    it('stores a hashed, single-use, expiring token for an existing account', async () => {
+      const user = {
+        id: 'u1',
+        email: 'user@example.com',
+        passwordHash: passwordHash,
+        passwordResetToken: null as string | null,
+        passwordResetExpiresAt: null as Date | null,
+      };
+      usersRepo.findOne.mockResolvedValue(user);
+      usersRepo.save.mockResolvedValue(user);
+
+      const result = await service.requestPasswordReset('user@example.com', '1.2.3.4');
+
+      expect(result.message).toBe(GENERIC);
+      expect(user.passwordResetToken).toMatch(/^[0-9a-f]{64}$/);
+      expect(user.passwordResetExpiresAt).toBeInstanceOf(Date);
+      expect(user.passwordResetExpiresAt!.getTime()).toBeGreaterThan(Date.now());
+    });
+
+    it('rate-limits by email and by IP without revealing the limit', async () => {
+      const user = {
+        id: 'u1',
+        email: 'user@example.com',
+        passwordHash: 'hash',
+        passwordResetToken: null as string | null,
+        passwordResetExpiresAt: null as Date | null,
+      };
+      usersRepo.findOne.mockResolvedValue(user);
+      usersRepo.save.mockResolvedValue(user);
+
+      for (let i = 0; i < 5; i++) {
+        await service.requestPasswordReset('user@example.com', '1.2.3.4');
+      }
+      expect(usersRepo.save).toHaveBeenCalledTimes(5);
+
+      const limited = await service.requestPasswordReset('user@example.com', '1.2.3.4');
+      expect(limited.message).toBe(GENERIC);
+      expect(usersRepo.save).toHaveBeenCalledTimes(5);
+    });
+
+    it('updates the password and revokes all refresh-token families on success', async () => {
+      const user = {
+        id: 'u1',
+        email: 'user@example.com',
+        passwordHash: passwordHash,
+        passwordResetToken: createHash('sha256').update('valid-token').digest('hex'),
+        passwordResetExpiresAt: new Date(Date.now() + 10 * 60 * 1000),
+      };
+      usersRepo.findOne.mockResolvedValue(user);
+      usersRepo.save.mockResolvedValue(user);
+
+      const result = await service.resetPassword('valid-token', 'newPassword123');
+
+      expect(result.message).toMatch(/password updated/i);
+      expect(user.passwordResetToken).toBeNull();
+      expect(user.passwordResetExpiresAt).toBeNull();
+      expect(await argon2.verify(user.passwordHash as string, 'newPassword123')).toBe(true);
+      expect(refreshTokensRepo.update).toHaveBeenCalledWith(
+        { userId: 'u1', revokedAt: null },
+        { revokedAt: expect.any(Date) },
+      );
+    });
+
+    it('rejects expired tokens with GoneException', async () => {
+      usersRepo.findOne.mockResolvedValue({
+        id: 'u1',
+        passwordHash: 'hash',
+        passwordResetExpiresAt: new Date(Date.now() - 1000),
+      });
+
+      await expect(service.resetPassword('stale', 'newPassword123')).rejects.toThrow(
+        GoneException,
+      );
+    });
+
+    it('rejects replayed tokens after a successful reset', async () => {
+      const user = {
+        id: 'u1',
+        email: 'user@example.com',
+        passwordHash: passwordHash,
+        passwordResetToken: createHash('sha256').update('one-time-token').digest('hex'),
+        passwordResetExpiresAt: new Date(Date.now() + 10 * 60 * 1000),
+      };
+      usersRepo.findOne.mockResolvedValueOnce(user);
+      usersRepo.save.mockResolvedValue(user);
+
+      await service.resetPassword('one-time-token', 'newPassword123');
+
+      // The token was cleared on the persisted user, so the replay lookup
+      // finds no row.
+      usersRepo.findOne.mockResolvedValueOnce(null);
+      await expect(service.resetPassword('one-time-token', 'otherPassword123')).rejects.toThrow(
+        NotFoundException,
+      );
+    });
+
+    it('allows login with the new password hash after reset', async () => {
+      const user = {
+        id: 'u1',
+        email: 'user@example.com',
+        passwordHash: passwordHash,
+        passwordResetToken: createHash('sha256').update('login-token').digest('hex'),
+        passwordResetExpiresAt: new Date(Date.now() + 10 * 60 * 1000),
+      };
+      usersRepo.findOne
+        .mockResolvedValueOnce(user) // resetPassword lookup
+        .mockResolvedValueOnce(user); // login lookup
+      usersRepo.save.mockResolvedValue(user);
+
+      await service.resetPassword('login-token', 'brandNewPassword9');
+
+      // The stored hash no longer verifies the old password but verifies the new one.
+      expect(await argon2.verify(user.passwordHash as string, 'brandNewPassword9')).toBe(true);
+      expect(await argon2.verify(user.passwordHash as string, 'password123')).toBe(false);
+    });
+  });
 });

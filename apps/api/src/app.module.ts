@@ -28,10 +28,12 @@ import { AddMonitorStateAlerts1785312000000 } from "./database/migrations/178531
 import { AddAuthEnhancements1785398400000 } from "./database/migrations/1785398400000-add-auth-enhancements";
 import { CreateGraphSnapshots1785600000000 } from "./database/migrations/1785600000000-create-graph-snapshots";
 import { CreateNetworkSamples1785786400000 } from "./database/migrations/1785786400000-create-network-samples";
+import { AddPasswordReset1786100000000 } from "./database/migrations/1786100000000-add-password-reset";
+import { validateEnvironment } from "./config/env-validation";
 
 @Module({
   imports: [
-    ConfigModule.forRoot({ isGlobal: true }),
+    ConfigModule.forRoot({ isGlobal: true, validate: validateEnvironment }),
 ThrottlerModule.forRootAsync({
   inject: [ConfigService],
   useFactory: (config: ConfigService) => [
@@ -61,6 +63,7 @@ ThrottlerModule.forRootAsync({
           AddAuthEnhancements1785398400000,
           CreateGraphSnapshots1785600000000,
           CreateNetworkSamples1785786400000,
+          AddPasswordReset1786100000000,
         ],
         migrationsRun: config.get<string>("RUN_MIGRATIONS") === "true",
         logging: config.get<string>("NODE_ENV") === "development",

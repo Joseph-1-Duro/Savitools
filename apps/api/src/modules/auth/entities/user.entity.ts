@@ -46,6 +46,18 @@ export class User {
   })
   emailVerificationExpiresAt!: Date | null;
 
+  /** SHA-256 hash of the opaque reset token sent in the email (null once used) */
+  @Column({ name: 'password_reset_token', type: 'varchar', nullable: true })
+  passwordResetToken!: string | null;
+
+  /** When the password reset token expires (30 minutes after request) */
+  @Column({
+    name: 'password_reset_expires_at',
+    type: 'timestamptz',
+    nullable: true,
+  })
+  passwordResetExpiresAt!: Date | null;
+
   @CreateDateColumn({ name: 'created_at' })
   createdAt!: Date;
 
