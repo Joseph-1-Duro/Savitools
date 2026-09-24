@@ -26,6 +26,7 @@
     "@nestjs/throttler": "^5.1.2",
     "@nestjs/typeorm": "^10.0.2",
     "@nestjs/websockets": "^10.4.15",
+    "@simplewebauthn/server": "^14.0.2",
     "@stellar/stellar-sdk": "^13.1.0",
     "argon2": "^0.43.0",
     "bcryptjs": "^3.0.3",
@@ -39,7 +40,7 @@
     "resend": "^6.17.2",
     "rxjs": "^7.8.1",
     "socket.io": "^4.7.0",
-    "toml": "^3.0.0",
+    "smol-toml": "^1.9.0",
     "typeorm": "^0.3.20"
   },
   "devDependencies": {

@@ -4,6 +4,7 @@ import { FederationService } from './federation.service';
 import { ResolveQueryDto } from './dto/resolve-query.dto';
 import { TomlQueryDto } from './dto/toml-query.dto';
 import { SepQueryDto } from './dto/sep-query.dto';
+import { LinkPreviewQueryDto } from './dto/link-preview-query.dto';
 
 @ApiTags('federation')
 @Controller('federation')
@@ -45,5 +46,21 @@ export class FederationController {
   })
   getSepSupport(@Query() query: SepQueryDto) {
     return this.federationService.getSepSupport(query.domain);
+  }
+
+  @Get('link-preview')
+  @ApiOperation({
+    summary:
+      'Build a copyable SEP-6/24/31 transfer request link from stellar.toml (never signed or submitted)',
+  })
+  getLinkPreview(@Query() query: LinkPreviewQueryDto) {
+    return this.federationService.buildTransferRequestLink(query.domain, {
+      sep: query.sep,
+      asset: query.asset,
+      amount: query.amount,
+      memo: query.memo,
+      callback: query.callback,
+      account: query.account,
+    });
   }
 }

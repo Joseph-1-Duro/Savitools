@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   GoneException,
   Injectable,
   Logger,
@@ -12,6 +13,19 @@ import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import { InjectRepository } from '@nestjs/typeorm';
 import * as argon2 from 'argon2';
+import {
+  generateAuthenticationOptions,
+  generateRegistrationOptions,
+  verifyAuthenticationResponse,
+  verifyRegistrationResponse,
+} from '@simplewebauthn/server';
+import type {
+  AuthenticationResponseJSON,
+  AuthenticatorTransportFuture,
+  PublicKeyCredentialCreationOptionsJSON,
+  PublicKeyCredentialRequestOptionsJSON,
+  RegistrationResponseJSON,
+} from '@simplewebauthn/server';
 import {
   createCipheriv,
   createDecipheriv,
@@ -25,6 +39,10 @@ import { IsNull, Repository } from 'typeorm';
 import {
   ACCESS_TOKEN_TTL_SECONDS,
   EMAIL_VERIFICATION_TTL_SECONDS,
+  PASSKEY_CHALLENGE_TTL_SECONDS,
+  PASSKEY_MAX_PER_USER,
+  PASSKEY_REAUTH_SCOPE,
+  PASSKEY_REAUTH_TTL_SECONDS,
   PASSWORD_RESET_MAX_PER_EMAIL,
   PASSWORD_RESET_MAX_PER_IP,
   PASSWORD_RESET_TTL_SECONDS,
@@ -36,6 +54,7 @@ import { FluxaDto } from './dto/fluxa.dto';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
 import { ConnectedAccount, ConnectedProvider } from './entities/connected-account.entity';
+import { PasskeyCredential } from './entities/passkey.entity';
 import { RefreshToken } from './entities/refresh-token.entity';
 import { User } from './entities/user.entity';
 import { VaultKey, VaultKeyProvider } from './entities/vault-key.entity';
@@ -76,6 +95,8 @@ export class AuthService {
     private readonly connectedAccountsRepository: Repository<ConnectedAccount>,
     @InjectRepository(VaultKey)
     private readonly vaultKeysRepository: Repository<VaultKey>,
+    @InjectRepository(PasskeyCredential)
+    private readonly passkeysRepository: Repository<PasskeyCredential>,
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
   ) {
@@ -629,6 +650,446 @@ export class AuthService {
     }
 
     return null;
+  }
+
+  // ─── WebAuthn passkeys (Savitura/Savitools#218) ───────────────────────────
+
+  /**
+   * Single-use challenge store, bounded like the reset rate-limiter.
+   * Keys are `${userId}:${challenge}` so a challenge can only ever be
+   * consumed by the account that requested it.
+   */
+  private readonly passkeyChallenges = new Map<
+    string,
+    { challenge: string; type: 'registration' | 'assertion'; expiresAt: number; rpId: string }
+  >();
+
+  private storePasskeyChallenge(
+    userId: string,
+    type: 'registration' | 'assertion',
+    challenge: string,
+    rpId: string,
+    allowedCredentialIds?: string[],
+  ): void {
+    if (this.passkeyChallenges.size > 10_000) {
+      const now = Date.now();
+      for (const [key, entry] of this.passkeyChallenges) {
+        if (entry.expiresAt < now) this.passkeyChallenges.delete(key);
+      }
+    }
+    this.passkeyChallenges.set(`${userId}:${challenge}`, {
+      challenge,
+      type,
+      rpId,
+      expiresAt: Date.now() + PASSKEY_CHALLENGE_TTL_SECONDS * 1000,
+    });
+    if (allowedCredentialIds) {
+      this.challengeKeyCache.set(challenge, allowedCredentialIds.sort().join(','));
+    }
+  }
+
+  /** Consume a challenge: single-use — replay of the same challenge fails. */
+  private takePasskeyChallenge(
+    userId: string,
+    challenge: string,
+    type: 'registration' | 'assertion',
+    rpId: string,
+  ): void {
+    const key = `${userId}:${challenge}`;
+    const entry = this.passkeyChallenges.get(key);
+    this.passkeyChallenges.delete(key);
+    if (!entry || entry.expiresAt < Date.now()) {
+      throw new UnauthorizedException(
+        'PASSKEY_CHALLENGE_INVALID: challenge is expired, unknown, or already used',
+      );
+    }
+    if (entry.type !== type || entry.rpId !== rpId) {
+      throw new UnauthorizedException('PASSKEY_CHALLENGE_MISMATCH');
+    }
+  }
+
+  private webAuthnConfig(): { rpId: string; rpName: string; origin: string } {
+    const origin =
+      this.configService.get<string>('WEB_ORIGIN') ??
+      this.configService.get<string>('PASSKEY_ORIGIN') ??
+      'http://localhost:3000';
+    const rpId =
+      this.configService.get<string>('PASSKEY_RP_ID') ??
+      new URL(origin).hostname;
+    const rpName = this.configService.get<string>('RP_NAME', 'SaviTools');
+    return { rpId, rpName, origin };
+  }
+
+  /**
+   * Mint a short-lived reauthentication grant after a fresh password check.
+   * Passkey registration, renaming, and revocation all require one.
+   */
+  async requestPasskeyReauth(
+    userId: string,
+    password: string,
+  ): Promise<{ reauthToken: string; expiresIn: number }> {
+    const user = await this.usersRepository.findOne({ where: { id: userId } });
+    if (!user?.passwordHash) {
+      throw new ForbiddenException(
+        'Reauthentication requires a password login; accounts without a password cannot be reauthenticated',
+      );
+    }
+    const valid = await argon2.verify(user.passwordHash, password);
+    if (!valid) {
+      throw new UnauthorizedException('Invalid password');
+    }
+
+    const reauthToken = this.jwtService.sign(
+      { sub: user.id, scope: PASSKEY_REAUTH_SCOPE },
+      {
+        secret: this.configService.getOrThrow<string>('JWT_SECRET'),
+        expiresIn: PASSKEY_REAUTH_TTL_SECONDS,
+      },
+    );
+
+    return { reauthToken, expiresIn: PASSKEY_REAUTH_TTL_SECONDS };
+  }
+
+  private verifyReauthToken(reauthToken: string, userId: string): void {
+    let payload: { sub?: string; scope?: string };
+    try {
+      payload = this.jwtService.verify(reauthToken, {
+        secret: this.configService.getOrThrow<string>('JWT_SECRET'),
+      });
+    } catch {
+      throw new UnauthorizedException('REAUTH_REQUIRED: reauthentication grant expired or invalid');
+    }
+    if (payload.sub !== userId || payload.scope !== PASSKEY_REAUTH_SCOPE) {
+      throw new ForbiddenException('Reauthentication grant is not valid for this account');
+    }
+  }
+
+  /** Begin passkey registration: requires a fresh reauthentication grant. */
+  async beginPasskeyRegistration(
+    userId: string,
+    reauthToken: string,
+    options?: {
+      rpId?: string;
+      rpName?: string;
+    },
+  ): Promise<{ options: PublicKeyCredentialCreationOptionsJSON }> {
+    const user = await this.usersRepository.findOne({ where: { id: userId } });
+    if (!user) throw new NotFoundException('User not found');
+    this.verifyReauthToken(reauthToken, userId);
+
+    if (!user.emailVerified) {
+      throw new ForbiddenException('Verify your email before registering a passkey');
+    }
+
+    const existing = await this.passkeysRepository.find({
+      where: { userId, revokedAt: IsNull() },
+    });
+    if (existing.length >= PASSKEY_MAX_PER_USER) {
+      throw new ConflictException(
+        `Maximum of ${PASSKEY_MAX_PER_USER} passkeys per account reached`,
+      );
+    }
+
+    const { rpId, rpName } = {
+      rpId:
+        options?.rpId ??
+        this.configService.get<string>('PASSKEY_RP_ID') ??
+        new URL(this.webOrigin()).hostname,
+      rpName: options?.rpName ?? 'SaviTools',
+    };
+
+    const creationOptions = await generateRegistrationOptions({
+      rpName,
+      rpID: rpId,
+      userID: new TextEncoder().encode(user.id),
+      userName: user.email,
+      attestationType: 'none',
+      excludeCredentials: existing.map((c) => ({
+        id: c.credentialId,
+        transports: (c.transports ?? []) as AuthenticatorTransportFuture[],
+      })),
+    });
+
+    this.storePasskeyChallenge(
+      userId,
+      'registration',
+      creationOptions.challenge,
+      rpId,
+    );
+
+    return { options: creationOptions };
+  }
+
+  private webOrigin(): string {
+    return this.configService.get<string>('WEB_ORIGIN', 'http://localhost:3000');
+  }
+
+  /** Verify an attestation response and persist the credential. */
+  async verifyPasskeyRegistration(
+    userId: string,
+    reauthToken: string,
+    name: string,
+    registrationResponse: RegistrationResponseJSON,
+    transports?: string[],
+  ): Promise<PasskeyCredential> {
+    this.verifyReauthToken(reauthToken, userId);
+
+    const clientDataHashInput = (registrationResponse.response.clientDataJSON ?? '') as string;
+    if (!clientDataHashInput) {
+      throw new BadRequestException('registrationResponse.response.clientDataJSON is required');
+    }
+
+    const { rpId } = {
+      rpId:
+        this.configService.get<string>('PASSKEY_RP_ID') ??
+        new URL(this.webOrigin()).hostname,
+    };
+
+    // The challenge bound to this registration attempt must still be
+    // pending; it is consumed below after attestation verification.
+    let expectedChallenge = '';
+    try {
+      const clientData = JSON.parse(
+        Buffer.from(clientDataHashInput, 'base64url').toString('utf8'),
+      ) as { challenge?: string };
+      expectedChallenge = clientData.challenge ?? '';
+    } catch {
+      throw new BadRequestException('Malformed clientDataJSON in registration response');
+    }
+
+    let verification;
+    try {
+      verification = await verifyRegistrationResponse({
+        response: registrationResponse,
+        expectedChallenge,
+        expectedOrigin: this.webOrigin(),
+        expectedRPID: rpId,
+        requireUserVerification: false,
+      });
+    } catch (err) {
+      throw new BadRequestException(
+        `Passkey registration failed: ${err instanceof Error ? err.message : 'invalid attestation'}`,
+      );
+    }
+
+    if (!verification.verified || !verification.registrationInfo) {
+      throw new BadRequestException('Passkey registration could not be verified');
+    }
+
+    this.takePasskeyChallenge(userId, expectedChallenge, 'registration', rpId);
+
+    const { credential } = verification.registrationInfo;
+
+    const stored = this.passkeysRepository.create({
+      userId,
+      name,
+      credentialId: credential.id,
+      algorithm: credential.algorithm,
+      publicKey: Buffer.from(credential.publicKey).toString('base64url'),
+      counter: 0,
+      transports: transports ?? credential.transports ?? null,
+    });
+
+    return this.passkeysRepository.save(stored);
+  }
+
+  /** Begin assertion login for an account (no password involved). */
+  async beginPasskeyLogin(
+    email?: string,
+    options?: { rpId?: string },
+  ): Promise<{ options: PublicKeyCredentialRequestOptionsJSON; allowCredentials?: Array<{ id: string }> }> {
+    const { rpId } = {
+      rpId:
+        options?.rpId ??
+        this.configService.get<string>('PASSKEY_RP_ID') ??
+        new URL(this.webOrigin()).hostname,
+    };
+
+    let allowCredentials: Array<{ id: string }> | undefined;
+    if (email) {
+      const user = await this.usersRepository.findOne({
+        where: { email: email.trim().toLowerCase() },
+      });
+      if (user) {
+        const credentials = await this.passkeysRepository.find({
+          where: { userId: user.id, revokedAt: IsNull() },
+        });
+        allowCredentials = credentials.map((c) => ({ id: c.credentialId }));
+      }
+    }
+
+    const authOptions = generateAuthenticationOptions({
+      rpID: rpId,
+      allowCredentials,
+      userVerification: 'preferred',
+    });
+
+    // Assertion challenges are stored under a stable owner hash of the
+    // allowed credential ids (or 'anonymous' for discoverable flows) and
+    // constrained to those credentials at verification time.
+    const challengeOwner = allowCredentials
+      ? this.userIdForChallenge(allowCredentials)
+      : 'anonymous';
+    this.storePasskeyChallenge(
+      challengeOwner,
+      'assertion',
+      authOptions.challenge,
+      rpId,
+      allowCredentials?.map((c) => c.id),
+    );
+
+    return { options: authOptions, allowCredentials };
+  }
+
+  private challengeKeyCache = new Map<string, string>();
+
+  /** Resolve the storage key owner for a login challenge based on allowCredentials. */
+  private userIdForChallenge(allowCredentials: Array<{ id: string }>): string {
+    const ids = allowCredentials.map((c) => c.id).sort().join(',');
+    return createHash('sha256').update(ids).digest('hex').slice(0, 24);
+  }
+
+  /** Consume an assertion challenge and enforce any credential allow-list. */
+  private claimAssertionChallenge(
+    challenge: string,
+    credentialId: string,
+    credentialUserId: string,
+    rpId: string,
+  ): void {
+    const allowedRaw = this.challengeKeyCache.get(challenge);
+    if (allowedRaw) {
+      const allowed = allowedRaw.split(',');
+      if (!allowed.includes(credentialId)) {
+        throw new UnauthorizedException(
+          'PASSKEY_CHALLENGE_MISMATCH: credential was not in the challenge allow-list',
+        );
+      }
+      const owner = this.userIdForChallenge(allowed.map((id) => ({ id })));
+      this.takePasskeyChallenge(owner, challenge, 'assertion', rpId);
+      return;
+    }
+
+    // Discoverable credential: challenges are keyed per user when issued
+    // via beginPasskeyLogin without allowCredentials.
+    this.takePasskeyChallenge(credentialUserId, challenge, 'assertion', rpId);
+  }
+
+  /** Verify an assertion and issue the same session as password login. */
+  async verifyPasskeyLogin(
+    assertionResponse: AuthenticationResponseJSON,
+    ctx: IssueSessionContext = {},
+  ): Promise<{ user: User; tokens: SessionTokens }> {
+    const credentialId = assertionResponse.id ?? assertionResponse.rawId;
+    if (!credentialId) {
+      throw new BadRequestException('Assertion response must include a credential id');
+    }
+
+    const credential = await this.passkeysRepository.findOne({
+      where: { credentialId },
+      relations: ['user'],
+    });
+
+    if (!credential) {
+      throw new UnauthorizedException('PASSKEY_UNKNOWN');
+    }
+    if (credential.revokedAt) {
+      throw new UnauthorizedException('PASSKEY_REVOKED');
+    }
+
+    const { rpId, origin } = {
+      rpId:
+        this.configService.get<string>('PASSKEY_RP_ID') ??
+        new URL(this.webOrigin()).hostname,
+      origin: this.webOrigin(),
+    };
+
+    // Consume the challenge before verification so replays never verify.
+    this.claimAssertionChallenge(
+      assertionResponse.response.challenge ?? '',
+      credentialId,
+      credential.userId,
+      rpId,
+    );
+
+    let verification;
+    try {
+      verification = verifyAuthenticationResponse({
+        response: assertionResponse,
+        expectedChallenge: assertionResponse.response.challenge ?? '',
+        expectedOrigin: origin,
+        expectedRPID: rpId,
+        credential: {
+          id: credential.credentialId,
+          publicKey: Buffer.from(credential.publicKey, 'base64url'),
+          counter: Number(credential.counter),
+          transports: (credential.transports ?? []) as AuthenticatorTransportFuture[],
+        },
+        requireUserVerification: false,
+      });
+    } catch (err) {
+      throw new UnauthorizedException(
+        `PASSKEY_ASSERTION_INVALID: ${err instanceof Error ? err.message : 'verification failed'}`,
+      );
+    }
+
+    if (!verification.valid) {
+      throw new UnauthorizedException('PASSKEY_ASSERTION_INVALID');
+    }
+
+    if (
+      typeof verification.authenticationInfo.newCounter === 'number' &&
+      verification.authenticationInfo.newCounter !== 0 &&
+      verification.authenticationInfo.newCounter <= Number(credential.counter)
+    ) {
+      throw new UnauthorizedException('PASSKEY_REPLAY_OR_CLONE_DETECTED');
+    }
+
+    credential.counter = verification.authenticationInfo.newCounter;
+    credential.lastUsedAt = new Date();
+    await this.passkeysRepository.save(credential);
+
+    const tokens = await this.issueSession(credential.user, ctx);
+    return { user: credential.user, tokens };
+  }
+
+  async listPasskeys(userId: string): Promise<
+    Array<{ id: string; name: string; createdAt: Date; lastUsedAt: Date | null; revokedAt: Date | null }>
+  > {
+    const passkeys = await this.passkeysRepository.find({
+      where: { userId },
+      order: { createdAt: 'DESC' },
+    });
+    return passkeys.map((p) => ({
+      id: p.id,
+      name: p.name,
+      createdAt: p.createdAt,
+      lastUsedAt: p.lastUsedAt,
+      revokedAt: p.revokedAt,
+    }));
+  }
+
+  async renamePasskey(credentialId: string, userId: string, name: string, reauthToken: string): Promise<void> {
+    this.verifyReauthToken(reauthToken, userId);
+    const passkey = await this.passkeysRepository.findOne({
+      where: { id: credentialId, userId },
+    });
+    if (!passkey) throw new NotFoundException('Passkey not found');
+    passkey.name = name;
+    await this.passkeysRepository.save(passkey);
+  }
+
+  /** Revocation is permanent — revoked credentials can never authenticate. */
+  async revokePasskey(credentialId: string, userId: string, reauthToken: string): Promise<void> {
+    this.verifyReauthToken(reauthToken, userId);
+    const passkey = await this.passkeysRepository.findOne({
+      where: { id: credentialId, userId },
+    });
+    if (!passkey) throw new NotFoundException('Passkey not found');
+    if (passkey.revokedAt) {
+      throw new ConflictException('Passkey is already revoked');
+    }
+    passkey.revokedAt = new Date();
+    await this.passkeysRepository.save(passkey);
   }
 
   // ─── Misc helpers ─────────────────────────────────────────────────────────

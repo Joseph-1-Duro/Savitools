@@ -1,8 +1,17 @@
 'use client';
 
 import { useState, useRef, useCallback } from 'react';
-import { Upload, FileCode, Terminal, ExternalLink, Clock, Trash2 } from 'lucide-react';
-import { deployContract, invokeContract, getContractInfo, type DeployedContract } from '@/lib/api';
+import { Upload, FileCode, Terminal, ExternalLink, Clock, Trash2, BookOpen, Link as LinkIcon } from 'lucide-react';
+import {
+  attachContractAbi,
+  deployContract,
+  encodeContractAbiArguments,
+  getContractAbi,
+  invokeContract,
+  getContractInfo,
+  type AbiCatalogEntry,
+  type DeployedContract,
+} from '@/lib/api';
 
 const STELLAR_EXPERT_URL = 'https://stellar.expert/explorer/testnet/contract';
 
@@ -19,6 +28,202 @@ function loadHistory(): DeployedContract[] {
 function saveHistory(contracts: DeployedContract[]) {
   if (typeof window === 'undefined') return;
   window.localStorage.setItem('savitools:contracts:history', JSON.stringify(contracts));
+}
+
+function AbiCatalogPanel({ contractId }: { contractId: string }) {
+  const [abiJson, setAbiJson] = useState('');
+  const [abiError, setAbiError] = useState('');
+  const [catalog, setCatalog] = useState<AbiCatalogEntry | null>(null);
+  const [selectedMethod, setSelectedMethod] = useState<string>('');
+  const [argValues, setArgValues] = useState<Record<string, string>>({});
+  const [encoded, setEncoded] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  const loadCatalog = async () => {
+    setLoading(true);
+    setAbiError('');
+    try {
+      const entry = await getContractAbi(contractId);
+      setCatalog(entry);
+    } catch (err: unknown) {
+      setAbiError(err instanceof Error ? err.message : 'No ABI attached yet.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const attach = async () => {
+    setAbiError('');
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(abiJson);
+    } catch {
+      setAbiError('ABI document must be valid JSON');
+      return;
+    }
+    setLoading(true);
+    try {
+      const entry = await attachContractAbi(contractId, parsed);
+      setCatalog(entry);
+      setAbiJson('');
+    } catch (err: unknown) {
+      const message =
+        err instanceof Error ? err.message : 'ABI validation failed.';
+      setAbiError(message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const encodeArgs = async () => {
+    if (!catalog || !selectedMethod) return;
+    const method = catalog.methods.find((m) => m.name === selectedMethod);
+    if (!method) return;
+    setAbiError('');
+    try {
+      const ordered = method.arguments.map((a) => argValues[a.name] ?? '');
+      const results = await encodeContractAbiArguments(contractId, selectedMethod, ordered);
+      setEncoded(results.map((r) => `${r.name}: ${r.xdrBase64}`).join('\n'));
+    } catch (err: unknown) {
+      setAbiError(err instanceof Error ? err.message : 'Encoding failed.');
+    }
+  };
+
+  return (
+    <div className="rounded-lg border border-border p-6 space-y-4">
+      <h2 className="text-sm font-medium flex items-center gap-2">
+        <BookOpen className="h-4 w-4" />
+        Contract ABI Catalog
+      </h2>
+
+      <p className="text-xs text-muted-foreground">
+        Attach a validated interface JSON to browse callable methods and emitted
+        events before invoking. SaviTools never converts amounts through binary
+        floating point — integers stay decimal strings.
+      </p>
+
+      <div className="flex gap-2">
+        <input
+          value={abiJson}
+          onChange={(e) => setAbiJson(e.target.value)}
+          placeholder='{"methods":[{"name":"transfer","args":[...]}],"events":[...]}'
+          className="flex-1 rounded-md border border-input bg-background px-3 py-2 text-xs font-mono"
+          spellCheck={false}
+        />
+        <button
+          type="button"
+          onClick={() => void attach()}
+          disabled={loading || !abiJson.trim()}
+          className="rounded-md bg-primary text-primary-foreground px-4 py-2 text-xs font-medium disabled:opacity-50"
+        >
+          Attach
+        </button>
+        <button
+          type="button"
+          onClick={() => void loadCatalog()}
+          disabled={loading}
+          className="rounded-md border border-border px-4 py-2 text-xs font-medium disabled:opacity-50"
+        >
+          Load
+        </button>
+      </div>
+
+      {abiError && (
+        <div className="rounded-md bg-destructive/10 border border-destructive/20 px-4 py-3">
+          <p className="text-xs text-destructive font-mono break-all">{abiError}</p>
+        </div>
+      )}
+
+      {catalog && (
+        <div className="space-y-3">
+          <div>
+            <p className="text-xs font-medium text-muted-foreground mb-1.5">Methods</p>
+            <div className="space-y-1">
+              {catalog.methods.map((m) => (
+                <button
+                  type="button"
+                  key={m.name}
+                  onClick={() => setSelectedMethod(m.name)}
+                  className={`w-full text-left rounded border px-3 py-2 text-xs font-mono transition-colors ${
+                    selectedMethod === m.name ? 'border-primary bg-primary/5' : 'border-border'
+                  }`}
+                >
+                  {m.name}({m.arguments.map((a) => `${a.name}: ${a.type}`).join(', ')}) → {m.returnType}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {selectedMethod && (
+            <div className="space-y-2">
+              <p className="text-xs font-medium text-muted-foreground">Arguments</p>
+              {(catalog.methods.find((m) => m.name === selectedMethod)?.arguments ?? []).map((a) => (
+                <div key={a.name} className="flex items-center gap-2">
+                  <span className="w-24 shrink-0 text-xs font-mono text-muted-foreground">{a.name}</span>
+                  <input
+                    value={argValues[a.name] ?? ''}
+                    onChange={(e) =>
+                      setArgValues((prev) => ({ ...prev, [a.name]: e.target.value }))
+                    }
+                    placeholder={`Enter ${a.type} as a plain string`}
+                    className="flex-1 rounded border border-input bg-background px-2 py-1.5 text-xs font-mono"
+                    spellCheck={false}
+                  />
+                </div>
+              ))}
+              <button
+                type="button"
+                onClick={() => void encodeArgs()}
+                className="rounded-md border border-border px-3 py-1.5 text-xs font-medium"
+              >
+                Encode with SCVal
+              </button>
+              {encoded && (
+                <pre className="text-xs font-mono whitespace-pre-wrap break-all rounded-md bg-muted/30 border border-border px-4 py-3">
+                  {encoded}
+                </pre>
+              )}
+            </div>
+          )}
+
+          <div>
+            <p className="text-xs font-medium text-muted-foreground mb-1.5">Events</p>
+            <div className="space-y-1">
+              {catalog.events.map((e) => (
+                <div key={e.name} className="rounded border border-border px-3 py-2 text-xs font-mono">
+                  <span className="inline-flex items-center gap-2">
+                    {e.name}
+                    <LinkIcon className="h-3 w-3 text-muted-foreground" />
+                    <a
+                      href={`/inspector?contractId=${encodeURIComponent(contractId)}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-primary hover:underline inline-flex items-center gap-1"
+                    >
+                      Events <ExternalLink className="h-3 w-3" />
+                    </a>
+                    <a
+                      href={`/composer`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-primary hover:underline inline-flex items-center gap-1"
+                    >
+                      Composer <ExternalLink className="h-3 w-3" />
+                    </a>
+                  </span>
+                  {e.topics.length > 0 && (
+                    <div className="text-muted-foreground mt-1">
+                      topics: {e.topics.map((t) => `${t.name}${t.indexed ? ' (indexed)' : ''}`).join(', ')}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }
 
 export function ContractsTool() {
@@ -337,6 +542,9 @@ export function ContractsTool() {
           </>
         )}
       </div>
+
+      {/* ABI Catalog Panel */}
+      {selectedContract && <AbiCatalogPanel contractId={selectedContract} />}
 
       {/* Contract History */}
       <div className="rounded-lg border border-border p-6 space-y-4">

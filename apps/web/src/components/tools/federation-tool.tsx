@@ -3,10 +3,12 @@
 import {
   fetchSepSupport,
   fetchStellarToml,
+  previewTransferLink,
   resolveFederation,
   type FederationResolveResult,
   type SepResult,
   type TomlResult,
+  type TransferLinkResult,
 } from '@/lib/api';
 import {
   AlertTriangle,
@@ -17,6 +19,7 @@ import {
   ExternalLink,
   FileText,
   Globe,
+  Link2,
   Loader2,
   Search,
   Shield,
@@ -336,8 +339,179 @@ function TomlPanel({
   );
 }
 
-function SepPanel({ data }: { data: SepResult }) {
+function LinkPreviewPanel({
+  domain,
+  copied,
+  copy,
+}: {
+  domain: string;
+  copied: string | null;
+  copy: (t: string, id: string) => void;
+}) {
+  const [sep, setSep] = useState<'6' | '24' | '31'>('24');
+  const [asset, setAsset] = useState('');
+  const [amount, setAmount] = useState('');
+  const [memo, setMemo] = useState('');
+  const [callback, setCallback] = useState('');
+  const [account, setAccount] = useState('');
+  const [building, setBuilding] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<TransferLinkResult | null>(null);
+
+  const build = async () => {
+    setBuilding(true);
+    setError(null);
+    setResult(null);
+    try {
+      const preview = await previewTransferLink({
+        domain,
+        sep,
+        asset: asset.trim(),
+        amount: amount.trim(),
+        memo: memo.trim() || undefined,
+        callback: callback.trim() || undefined,
+        account: account.trim() || undefined,
+      });
+      setResult(preview);
+    } catch (err: unknown) {
+      setError(
+        err instanceof Error ? err.message : 'Failed to build request link.',
+      );
+    } finally {
+      setBuilding(false);
+    }
+  };
+
   return (
+    <CollapsiblePanel
+      title="Request Link Preview"
+      icon={<Link2 className="h-4 w-4 text-sky-400 shrink-0" />}
+      badge={
+        <span className="text-xs text-muted-foreground font-normal">
+          SEP-6 / 24 / 31
+        </span>
+      }
+    >
+      <div className="grid grid-cols-2 gap-2 text-xs mb-3">
+        <label className="flex flex-col gap-1">
+          <span className="text-muted-foreground">SEP</span>
+          <select
+            value={sep}
+            onChange={(e) => setSep(e.target.value as '6' | '24' | '31')}
+            className="rounded border border-border bg-background px-2 py-1.5 font-mono"
+          >
+            <option value="6">SEP-6</option>
+            <option value="24">SEP-24</option>
+            <option value="31">SEP-31</option>
+          </select>
+        </label>
+        <label className="flex flex-col gap-1">
+          <span className="text-muted-foreground">Asset code</span>
+          <input
+            value={asset}
+            onChange={(e) => setAsset(e.target.value)}
+            placeholder="USDC"
+            className="rounded border border-border bg-background px-2 py-1.5 font-mono"
+            spellCheck={false}
+          />
+        </label>
+        <label className="flex flex-col gap-1">
+          <span className="text-muted-foreground">Amount (decimal string)</span>
+          <input
+            value={amount}
+            onChange={(e) => setAmount(e.target.value)}
+            placeholder="100.50"
+            className="rounded border border-border bg-background px-2 py-1.5 font-mono"
+            spellCheck={false}
+          />
+        </label>
+        <label className="flex flex-col gap-1">
+          <span className="text-muted-foreground">Memo (optional)</span>
+          <input
+            value={memo}
+            onChange={(e) => setMemo(e.target.value)}
+            className="rounded border border-border bg-background px-2 py-1.5 font-mono"
+            spellCheck={false}
+          />
+        </label>
+        <label className="flex flex-col gap-1 col-span-2">
+          <span className="text-muted-foreground">Callback URL (optional, https)</span>
+          <input
+            value={callback}
+            onChange={(e) => setCallback(e.target.value)}
+            placeholder="https://wallet.example/callback"
+            className="rounded border border-border bg-background px-2 py-1.5 font-mono"
+            spellCheck={false}
+          />
+        </label>
+        {sep !== '31' && (
+          <label className="flex flex-col gap-1 col-span-2">
+            <span className="text-muted-foreground">Account (G…)</span>
+            <input
+              value={account}
+              onChange={(e) => setAccount(e.target.value)}
+              className="rounded border border-border bg-background px-2 py-1.5 font-mono"
+              spellCheck={false}
+            />
+          </label>
+        )}
+      </div>
+
+      <button
+        type="button"
+        onClick={() => void build()}
+        disabled={building || !asset.trim() || !amount.trim()}
+        className="px-3 py-1.5 text-xs font-medium rounded-md bg-primary text-primary-foreground disabled:opacity-40 flex items-center gap-2"
+      >
+        {building ? (
+          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+        ) : (
+          'Preview link'
+        )}
+      </button>
+
+      {error && (
+        <div className="flex items-start gap-2 text-xs text-red-400 bg-red-400/10 rounded p-2 mt-3">
+          <XCircle className="h-3.5 w-3.5 mt-0.5 shrink-0" />
+          {error}
+        </div>
+      )}
+
+      {result && (
+        <div className="mt-3 space-y-2">
+          <div className="rounded bg-muted/30 p-2">
+            <div className="grid grid-cols-[120px_1fr] gap-x-3 py-0.5 text-xs">
+              <span className="text-muted-foreground">SEP</span>
+              <span className="font-mono text-xs">{result.sep}</span>
+            </div>
+            <div className="grid grid-cols-[120px_1fr] gap-x-3 py-0.5">
+              <span className="text-muted-foreground">Endpoint</span>
+              <span className="font-mono text-xs break-all">{result.endpoint}</span>
+            </div>
+            <div className="grid grid-cols-[120px_1fr] gap-x-3 py-0.5">
+              <span className="text-muted-foreground">Request URL</span>
+              <span className="font-mono text-xs break-all">
+                {result.url}
+                <CopyButton
+                  text={result.url}
+                  id="link-preview-url"
+                  copied={copied}
+                  copy={copy}
+                />
+              </span>
+            </div>
+          </div>
+          <div className="flex items-start gap-2 text-xs text-amber-400 bg-amber-400/10 rounded p-2">
+            <AlertTriangle className="h-3.5 w-3.5 mt-0.5 shrink-0" />
+            <span>{result.warning}</span>
+          </div>
+        </div>
+      )}
+    </CollapsiblePanel>
+  );
+}
+
+function SepPanel({ data }: { data: SepResult }) {  return (
     <CollapsiblePanel
       title="SEP Support"
       icon={<Shield className="h-4 w-4 text-violet-400 shrink-0" />}
@@ -564,6 +738,17 @@ export function FederationTool() {
           {fedData && <FederationPanel data={fedData} copied={copied} copy={copy} />}
           {tomlData && <TomlPanel data={tomlData} copied={copied} copy={copy} />}
           {sepData && <SepPanel data={sepData} />}
+          {tomlData && (
+            <LinkPreviewPanel
+              domain={
+                tomlData.federationServer
+                  ? new URL(tomlData.federationServer).hostname
+                  : (input.trim().split('*')[1] ?? stripProtocol(input.trim()))
+              }
+              copied={copied}
+              copy={copy}
+            />
+          )}
         </div>
       )}
     </div>

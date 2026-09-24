@@ -17,12 +17,15 @@ import {
   refreshSession,
   register as apiRegister,
   verifyEmail as apiVerifyEmail,
+  beginPasskeyLogin,
+  verifyPasskeyLogin,
 } from './api';
 
 interface AuthContextValue {
   user: AuthUser | null;
   loading: boolean;
   login: (email: string, password: string) => Promise<void>;
+  loginWithPasskey: (email?: string) => Promise<void>;
   register: (email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
   connectFluxaAccount: (apiKey: string) => Promise<void>;
@@ -64,6 +67,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setUser(result.user);
   }, []);
 
+  // Passkey login: runs the WebAuthn assertion in the browser, then the API
+  // verifies it and issues the same access/refresh cookie session as a
+  // password login. Password login and recovery remain untouched.
+  const loginWithPasskey = useCallback(async (email?: string) => {
+    const { startAuthentication } = await import('@simplewebauthn/browser');
+    const { options } = await beginPasskeyLogin(email);
+    const assertion = await startAuthentication({ optionsJSON: options });
+    const result = await verifyPasskeyLogin(assertion);
+    setUser(result.user);
+  }, []);
+
   const register = useCallback(async (email: string, password: string) => {
     // POST /auth/register now sends a verification email and returns { userId, message }.
     // The user is NOT logged in until they click the link. We return the message so the
@@ -91,13 +105,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       user,
       loading,
       login,
+      loginWithPasskey,
       register,
       logout,
       connectFluxaAccount,
       verifyEmail,
       refreshUser,
     }),
-    [user, loading, login, register, logout, connectFluxaAccount, verifyEmail, refreshUser],
+    [user, loading, login, loginWithPasskey, register, logout, connectFluxaAccount, verifyEmail, refreshUser],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

@@ -1,5 +1,9 @@
-import { BadRequestException, NotFoundException } from '@nestjs/common';
-import { FederationService } from './federation.service';
+import {
+  BadRequestException,
+  NotFoundException,
+  PayloadTooLargeException,
+} from '@nestjs/common';
+import { FederationService, TOML_MAX_BYTES } from './federation.service';
 
 const VALID_KEY =
   'GDJ47UQJNT6UOMV3CLNZ43XGDKOUM3UHV7V3FF3W4KMIRRNICNSS2N2H';
@@ -288,6 +292,80 @@ describe('FederationService', () => {
       expect(result.version).toBe('1.0.0');
       expect(result.validationWarnings).toEqual([]);
     });
+
+    // ── Regression tests for the bounded parser (Savitura/Savitools#220) ──
+
+    it('rejects oversized stellar.toml with a controlled 413', async () => {
+      mockFetch({
+        'huge.com/.well-known/stellar.toml': {
+          ok: true,
+          text: 'A="' + 'x'.repeat(TOML_MAX_BYTES + 1) + '"',
+        },
+      });
+
+      await expect(service.getToml('huge.com')).rejects.toThrow(
+        PayloadTooLargeException,
+      );
+    });
+
+    it('rejects deeply nested TOML with a controlled 400', async () => {
+      const depth = 100;
+      // Chain inline tables: a.b.c... each [bracket] adds one nesting level.
+      let line = 'value = 1';
+      for (let i = 0; i < depth; i++) {
+        line = `table_${i} = { ${line} }`;
+      }
+
+      mockFetch({
+        'deep.com/.well-known/stellar.toml': {
+          ok: true,
+          text: line,
+        },
+      });
+
+      await expect(service.getToml('deep.com')).rejects.toThrow(
+        BadRequestException,
+      );
+      await expect(service.getToml('deep.com')).rejects.toThrow(
+        /nesting depth/i,
+      );
+    });
+
+    it('cannot pollute Object.prototype via a pollution payload', async () => {
+      const pollution = '[[CURRENCIES]]\nCODE="USDC"\nISSUER="GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"\n__proto__ = { "polluted": true }\n';
+
+      mockFetch({
+        'evil.com/.well-known/stellar.toml': {
+          ok: true,
+          text: pollution,
+        },
+      });
+
+      await service.getToml('evil.com');
+
+      expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+      expect(
+        (Object.prototype as unknown as Record<string, unknown>).polluted,
+      ).toBeUndefined();
+    });
+
+    it('rejects malformed TOML with a controlled 400', async () => {
+      mockFetch({
+        'broken.com/.well-known/stellar.toml': {
+          ok: true,
+          text: 'key = [unclosed',
+        },
+      });
+
+      await expect(service.getToml('broken.com')).rejects.toThrow(
+        BadRequestException,
+      );
+    });
+
+    it('keeps SSRF validation active around the fetch', async () => {
+      await expect(service.getToml('169.254.169.254')).rejects.toThrow();
+      expect(global.fetch).not.toHaveBeenCalled();
+    });
   });
 
   describe('getSepSupport', () => {
@@ -413,6 +491,152 @@ describe('FederationService', () => {
       await expect(service.getSepSupport('not valid!!!')).rejects.toThrow(
         BadRequestException,
       );
+    });
+  });
+
+  describe('buildTransferRequestLink (#217)', () => {
+    const ANCHOR_TOML = [
+      'ACCOUNTS = []',
+      'TRANSFER_SERVER="https://anchor.example/api"',
+      'TRANSFER_SERVER_SEP0024="https://anchor.example/sep24"',
+      'DIRECT_PAYMENT_SERVER="https://anchor.example/sep31"',
+      '',
+      '[[CURRENCIES]]',
+      'CODE="USDC"',
+      'ISSUER="GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"',
+    ].join('\n');
+
+    beforeEach(() => {
+      mockFetch({
+        'anchor.example/.well-known/stellar.toml': {
+          ok: true,
+          text: ANCHOR_TOML,
+        },
+        'bare.example/.well-known/stellar.toml': {
+          ok: true,
+          text: 'ACCOUNTS = []\nTRANSFER_SERVER="https://bare.example/api"\n',
+        },
+      });
+    });
+
+    it('golden SEP-6 deposit link matches SEP-6 parameter and encoding rules', async () => {
+      const result = await service.buildTransferRequestLink('anchor.example', {
+        sep: '6',
+        asset: 'USDC',
+        amount: '100.50',
+        memo: 'ref 42',
+        account: VALID_KEY,
+      });
+
+      expect(result.endpoint).toBe('https://anchor.example/api');
+      expect(result.url).toBe(
+        'https://anchor.example/api/transactions?type=deposit&asset_code=USDC' +
+          `&account=${VALID_KEY}&amount=100.50&memo=ref+42&memo_type=text`,
+      );
+      expect(result.warning).toMatch(/will not sign or submit/i);
+    });
+
+    it('golden SEP-24 interactive link matches SEP-24 rules', async () => {
+      const result = await service.buildTransferRequestLink('anchor.example', {
+        sep: '24',
+        asset: 'USDC',
+        amount: '10',
+        account: VALID_KEY,
+      });
+
+      expect(result.endpoint).toBe('https://anchor.example/sep24');
+      expect(result.url).toBe(
+        'https://anchor.example/sep24/?asset_code=USDC&amount=10' +
+          `&account=${VALID_KEY}`,
+      );
+    });
+
+    it('golden SEP-31 direct payment link matches SEP-31 rules', async () => {
+      const result = await service.buildTransferRequestLink('anchor.example', {
+        sep: '31',
+        asset: 'USDC',
+        amount: '250',
+        callback: 'https://wallet.example/sep31-done',
+      });
+
+      expect(result.endpoint).toBe('https://anchor.example/sep31');
+      expect(result.url).toBe(
+        'https://anchor.example/sep31/?asset_code=USDC&amount=250&destination=https%3A%2F%2Fwallet.example%2Fsep31-done',
+      );
+    });
+
+    it('keeps amounts and memos as verbatim strings (no float conversion)', async () => {
+      const result = await service.buildTransferRequestLink('anchor.example', {
+        sep: '6',
+        asset: 'USDC',
+        amount: '0.0000001',
+        memo: 'M-10000000000000000',
+        account: VALID_KEY,
+      });
+
+      expect(result.url).toContain('amount=0.0000001');
+      expect(result.url).toContain('memo=M-10000000000000000');
+      expect(result.amount).toBe('0.0000001');
+    });
+
+    it('errors when the SEP endpoint is missing from stellar.toml', async () => {
+      await expect(
+        service.buildTransferRequestLink('bare.example', {
+          sep: '24',
+          asset: 'USDC',
+          amount: '10',
+          account: VALID_KEY,
+        }),
+      ).rejects.toThrow(/TRANSFER_SERVER_SEP0024/);
+    });
+
+    it('errors when the asset is unsupported by the anchor', async () => {
+      await expect(
+        service.buildTransferRequestLink('anchor.example', {
+          sep: '6',
+          asset: 'NOPE',
+          amount: '10',
+          account: VALID_KEY,
+        }),
+      ).rejects.toThrow(/not supported/);
+    });
+
+    it('errors on invalid amounts, malformed callbacks, and bad accounts', async () => {
+      await expect(
+        service.buildTransferRequestLink('anchor.example', {
+          sep: '6',
+          asset: 'USDC',
+          amount: '1e5',
+          account: VALID_KEY,
+        }),
+      ).rejects.toThrow(/decimal string/);
+
+      await expect(
+        service.buildTransferRequestLink('anchor.example', {
+          sep: '6',
+          asset: 'USDC',
+          amount: '10',
+          account: VALID_KEY,
+          callback: 'http://insecure.example/cb',
+        }),
+      ).rejects.toThrow(/callback/);
+
+      await expect(
+        service.buildTransferRequestLink('anchor.example', {
+          sep: '24',
+          asset: 'USDC',
+          amount: '10',
+          account: 'NOT-A-KEY',
+        }),
+      ).rejects.toThrow(/public key/);
+
+      await expect(
+        service.buildTransferRequestLink('anchor.example', {
+          sep: '24',
+          asset: 'USDC',
+          amount: '10',
+        }),
+      ).rejects.toThrow(/account/);
     });
   });
 });
