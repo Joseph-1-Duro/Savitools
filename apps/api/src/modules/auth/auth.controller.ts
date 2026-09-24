@@ -29,8 +29,10 @@ import {
 import { AuthService } from './auth.service';
 import { CurrentUser } from './decorators/current-user.decorator';
 import { FluxaDto } from './dto/fluxa.dto';
+import { ForgotPasswordDto } from './dto/forgot-password.dto';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
+import { ResetPasswordDto } from './dto/reset-password.dto';
 import { VerifyEmailDto } from './dto/verify-email.dto';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
 import { OptionalJwtAuthGuard } from './guards/optional-jwt-auth.guard';
@@ -103,6 +105,30 @@ export class AuthController {
         fluxaTenantId: user.fluxaTenantId,
       },
     };
+  }
+
+  // ─── Password reset (Savitura/Savitools#196) ──────────────────────────────
+
+  @Post('forgot-password')
+  @HttpCode(200)
+  @ApiOperation({ summary: 'Request a password reset email (enumeration-resistant)' })
+  @ApiResponse({ status: 200, description: 'Generic response, regardless of account existence' })
+  @ApiResponse({ status: 429, description: 'Too many reset requests from this IP or email' })
+  async forgotPassword(
+    @Body() dto: ForgotPasswordDto,
+    @Req() req: FastifyRequest,
+  ) {
+    return this.authService.requestPasswordReset(dto.email, extractIp(req));
+  }
+
+  @Post('reset-password')
+  @HttpCode(200)
+  @ApiOperation({ summary: 'Set a new password with a valid, unused, unexpired reset token' })
+  @ApiResponse({ status: 200, description: 'Password updated; existing sessions revoked' })
+  @ApiResponse({ status: 404, description: 'Invalid token' })
+  @ApiResponse({ status: 410, description: 'RESET_TOKEN_EXPIRED' })
+  async resetPassword(@Body() dto: ResetPasswordDto) {
+    return this.authService.resetPassword(dto.token, dto.password);
   }
 
   // ─── Token rotation ───────────────────────────────────────────────────────

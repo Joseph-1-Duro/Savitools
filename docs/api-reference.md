@@ -140,6 +140,55 @@ curl -X POST http://localhost:3001/api/v1/auth/login \
 
 ---
 
+#### POST `/auth/forgot-password`
+
+Request a password reset email (see Savitura/Savitools#196). The response is identical whether or not the account exists — the endpoint cannot be used to enumerate registered emails. Requests are rate-limited per IP and per email.
+
+**Request:**
+```bash
+curl -X POST http://localhost:3001/api/v1/auth/forgot-password \
+  -H "Content-Type: application/json" \
+  -d '{ "email": "user@example.com" }'
+```
+
+**Response (200):**
+```json
+{
+  "message": "If an account with that email exists, we have sent a link to reset your password."
+}
+```
+
+The email contains a link to `/reset-password?token=…`. The token is stored hashed (SHA-256), is single-use, and expires after 30 minutes.
+
+---
+
+#### POST `/auth/reset-password`
+
+Set a new password with a valid, unused, unexpired reset token. On success every active refresh-token family for the user is revoked, signing out all other sessions.
+
+**Request:**
+```bash
+curl -X POST http://localhost:3001/api/v1/auth/reset-password \
+  -H "Content-Type: application/json" \
+  -d '{
+    "token": "RESET_TOKEN_FROM_EMAIL",
+    "password": "NewSecurePassword123"
+  }'
+```
+
+**Response (200):**
+```json
+{
+  "message": "Password updated. You can now sign in with your new password."
+}
+```
+
+**Errors:**
+- `404`: Reset token is invalid (or already used)
+- `410`: `RESET_TOKEN_EXPIRED`
+
+---
+
 #### POST `/auth/refresh`
 
 Rotate refresh token and issue a new access token.

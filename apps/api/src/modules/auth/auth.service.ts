@@ -25,6 +25,10 @@ import { IsNull, Repository } from 'typeorm';
 import {
   ACCESS_TOKEN_TTL_SECONDS,
   EMAIL_VERIFICATION_TTL_SECONDS,
+  PASSWORD_RESET_MAX_PER_EMAIL,
+  PASSWORD_RESET_MAX_PER_IP,
+  PASSWORD_RESET_TTL_SECONDS,
+  PASSWORD_RESET_WINDOW_MS,
   REFRESH_TOKEN_TTL_SECONDS,
 } from './auth.constants';
 import { CreateVaultKeyDto } from './dto/create-vault-key.dto';
@@ -143,6 +147,130 @@ export class AuthService {
 
     const tokens = await this.issueSession(user, {});
     return { user, tokens };
+  }
+
+  // ─── Password reset (Savitura/Savitools#196) ───────────────────────────────
+
+  /** Generic response — identical whether or not the account exists, so the
+   *  endpoint cannot be used to enumerate registered emails. */
+  private static readonly PASSWORD_RESET_GENERIC_MESSAGE =
+    'If an account with that email exists, we have sent a link to reset your password.';
+
+  /**
+   * Sliding-window in-memory rate limiter keyed per process. Keyed by IP and
+   * by email so neither can be flooded indefinitely.
+   */
+  private readonly rateLimitBuckets = new Map<string, number[]>();
+
+  private isRateLimited(key: string, limit: number, windowMs: number): boolean {
+    const now = Date.now();
+    const hits = (this.rateLimitBuckets.get(key) ?? []).filter(
+      (timestamp) => now - timestamp < windowMs,
+    );
+    if (hits.length >= limit) {
+      this.rateLimitBuckets.set(key, hits);
+      return true;
+    }
+    hits.push(now);
+    this.rateLimitBuckets.set(key, hits);
+    if (this.rateLimitBuckets.size > 10_000) {
+      // Opportunistic cleanup to keep the map bounded.
+      for (const [k, timestamps] of this.rateLimitBuckets) {
+        if (timestamps.every((timestamp) => now - timestamp >= windowMs)) {
+          this.rateLimitBuckets.delete(k);
+        }
+      }
+    }
+    return false;
+  }
+
+  async requestPasswordReset(
+    email: string,
+    ipAddress?: string,
+  ): Promise<{ message: string }> {
+    const normalized = email.trim().toLowerCase();
+
+    if (
+      this.isRateLimited(
+        `pwreset:ip:${ipAddress ?? 'unknown'}`,
+        PASSWORD_RESET_MAX_PER_IP,
+        PASSWORD_RESET_WINDOW_MS,
+      ) ||
+      this.isRateLimited(
+        `pwreset:email:${normalized}`,
+        PASSWORD_RESET_MAX_PER_EMAIL,
+        PASSWORD_RESET_WINDOW_MS,
+      )
+    ) {
+      // Same generic response as a success — no signal for enumeration or abuse.
+      return { message: AuthService.PASSWORD_RESET_GENERIC_MESSAGE };
+    }
+
+    const user = await this.usersRepository.findOne({
+      where: { email: normalized },
+    });
+
+    if (!user?.passwordHash) {
+      return { message: AuthService.PASSWORD_RESET_GENERIC_MESSAGE };
+    }
+
+    const resetToken = randomBytes(32).toString('hex');
+    const tokenHash = createHash('sha256').update(resetToken).digest('hex');
+    user.passwordResetToken = tokenHash;
+    user.passwordResetExpiresAt = new Date(
+      Date.now() + PASSWORD_RESET_TTL_SECONDS * 1000,
+    );
+    await this.usersRepository.save(user);
+
+    try {
+      await this.sendPasswordResetEmail(user.email, resetToken);
+    } catch (error) {
+      this.logger.error(
+        `Failed to send password reset email to ${normalized}: ${error instanceof Error ? error.message : error}`,
+      );
+      throw error;
+    }
+
+    return { message: AuthService.PASSWORD_RESET_GENERIC_MESSAGE };
+  }
+
+  async resetPassword(
+    token: string,
+    newPassword: string,
+  ): Promise<{ message: string }> {
+    const tokenHash = createHash('sha256').update(token).digest('hex');
+    const user = await this.usersRepository.findOne({
+      where: { passwordResetToken: tokenHash },
+    });
+
+    if (!user) {
+      throw new NotFoundException('Reset token is invalid');
+    }
+
+    if (!user.passwordResetExpiresAt || user.passwordResetExpiresAt.getTime() <= Date.now()) {
+      throw new GoneException('RESET_TOKEN_EXPIRED');
+    }
+
+    // Single-use: clear the token before persisting the new password so a
+    // replay of the same token finds no matching row.
+    user.passwordResetToken = null;
+    user.passwordResetExpiresAt = null;
+    user.passwordHash = await argon2.hash(newPassword, {
+      type: argon2.argon2id,
+      memoryCost: 65536,  // 64 MiB
+      timeCost: 3,
+      parallelism: 4,
+    });
+    await this.usersRepository.save(user);
+
+    // Revoke every active refresh-token family for this user so any stolen
+    // session dies with the password change.
+    await this.refreshTokensRepository.update(
+      { userId: user.id, revokedAt: IsNull() },
+      { revokedAt: new Date() },
+    );
+
+    return { message: 'Password updated. You can now sign in with your new password.' };
   }
 
   // ─── Login ─────────────────────────────────────────────────────────────────
@@ -576,7 +704,7 @@ export class AuthService {
     );
     const verifyUrl = `${webOrigin}/verify-email?token=${token}`;
     const fromAddress = this.configService.get<string>(
-      'RESEND_FROM',
+      'RESEND_FROM_EMAIL',
       'SaviTools <noreply@savitools.dev>',
     );
 
@@ -609,6 +737,53 @@ export class AuthService {
       if (isProduction) {
         throw new ServiceUnavailableException('Failed to deliver verification email');
       }
+    }
+  }
+
+  /** Send the single-use password reset link. Mirrors the verification email. */
+  private async sendPasswordResetEmail(
+    email: string,
+    token: string,
+  ): Promise<void> {
+    const isProduction =
+      this.configService.get<string>('NODE_ENV') === 'production';
+    const webOrigin = this.configService.get<string>(
+      'WEB_ORIGIN',
+      'http://localhost:3000',
+    );
+    const resetUrl = `${webOrigin}/reset-password?token=${token}`;
+    const fromAddress = this.configService.get<string>(
+      'RESEND_FROM_EMAIL',
+      'SaviTools <noreply@savitools.dev>',
+    );
+
+    if (!this.resend) {
+      if (isProduction) {
+        throw new ServiceUnavailableException('Email delivery is unavailable');
+      }
+      this.logger.warn(
+        '[email] RESEND_API_KEY not configured. Password reset email was not sent.',
+      );
+      return;
+    }
+
+    try {
+      await this.resend.emails.send({
+        from: fromAddress,
+        to: email,
+        subject: 'Reset your SaviTools password',
+        html: `
+          <p>A password reset was requested for your SaviTools account.</p>
+          <p>Click the link below to choose a new password. It expires in 30 minutes and can only be used once.</p>
+          <p><a href="${resetUrl}">${resetUrl}</a></p>
+          <p>If you did not request this, you can safely ignore this email.</p>
+        `,
+      });
+    } catch (error) {
+      this.logger.error(
+        `Failed to send password reset email to ${email}: ${error instanceof Error ? error.message : error}`,
+      );
+      throw error;
     }
   }
 

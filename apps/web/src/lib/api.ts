@@ -43,6 +43,35 @@ export async function apiFetch<T>(
   return parseJson<T>(response);
 }
 
+/**
+ * Shared download helper: fetches an authenticated endpoint that responds
+ * with a file attachment and triggers a browser download. Used by the monitor
+ * CSV export and the inspector transaction export (see Savitura/Savitools#195).
+ */
+export async function downloadCsv(path: string, filename: string): Promise<void> {
+  const response = await fetch(`${API_URL}/v1${path}`, {
+    credentials: "include",
+  });
+
+  if (!response.ok) {
+    const body = (await response.json().catch(() => ({}))) as ApiErrorBody;
+    const message = Array.isArray(body.message)
+      ? body.message.join(", ")
+      : (body.message ?? response.statusText);
+    throw new Error(message);
+  }
+
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
+}
+
 export async function register(email: string, password: string) {
   return apiFetch<{ userId: string; message: string }>("/auth/register", {
     method: "POST",
@@ -61,6 +90,20 @@ export async function login(email: string, password: string) {
   return apiFetch<{ user: AuthUser }>("/auth/login", {
     method: "POST",
     body: JSON.stringify({ email, password }),
+  });
+}
+
+export async function requestPasswordReset(email: string) {
+  return apiFetch<{ message: string }>("/auth/forgot-password", {
+    method: "POST",
+    body: JSON.stringify({ email }),
+  });
+}
+
+export async function resetPassword(token: string, password: string) {
+  return apiFetch<{ message: string }>("/auth/reset-password", {
+    method: "POST",
+    body: JSON.stringify({ token, password }),
   });
 }
 

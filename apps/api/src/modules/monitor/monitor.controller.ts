@@ -10,6 +10,7 @@ import {
   HttpStatus,
   HttpCode,
   UseGuards,
+  BadRequestException,
   NotFoundException,
   ServiceUnavailableException,
   Logger,
@@ -19,6 +20,8 @@ import { MonitorService } from './monitor.service';
 import { CreateWatchDto } from './dto/create-watch.dto';
 import { PaginationQueryDto } from './dto/pagination-query.dto';
 import { RegisterWebhookDto } from './dto/register-webhook.dto';
+import { SearchEventsQueryDto } from './dto/search-events.dto';
+import { ExportEventsQueryDto } from './dto/export-events.dto';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { CurrentUser, AuthUser } from '../auth/decorators/current-user.decorator';
 import { ConfigService } from '@nestjs/config';
@@ -216,5 +219,89 @@ export class MonitorController {
   @UseGuards(JwtAuthGuard)
   async getWebhook(@CurrentUser() user: AuthUser) {
     return this.monitorService.getWebhook(user.id);
+  }
+
+  // ── Search & CSV export (Savitura/Savitools#195) ────────────
+
+  /**
+   * Search watch events across the current user's watches.
+   * User ownership is enforced downstream by scoping the query to `user.id`.
+   */
+  @Get('search')
+  @UseGuards(JwtAuthGuard)
+  async searchEvents(
+    @CurrentUser() user: AuthUser,
+    @Query() query: SearchEventsQueryDto,
+  ) {
+    this.assertIsoDate(query.from, 'from');
+    this.assertIsoDate(query.to, 'to');
+    return this.monitorService.searchEvents(user.id, query);
+  }
+
+  /**
+   * Stream the same search results as a CSV attachment. Rows are written in
+   * chunks by the service, so memory stays bounded even for 10,000-row
+   * exports (the export cap enforced by `ExportEventsQueryDto`).
+   */
+  @Get('search/export')
+  @UseGuards(JwtAuthGuard)
+  async exportSearchEventsCsv(
+    @CurrentUser() user: AuthUser,
+    @Query() query: ExportEventsQueryDto,
+    @Res() reply: FastifyReply,
+  ): Promise<void> {
+    this.assertIsoDate(query.from, 'from');
+    this.assertIsoDate(query.to, 'to');
+
+    reply.raw.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    reply.raw.setHeader(
+      'Content-Disposition',
+      'attachment; filename="monitor-search.csv"',
+    );
+    // UTF-8 BOM so spreadsheet tools detect the encoding.
+    reply.raw.write('\uFEFF');
+    reply.raw.write(
+      'event_type,occurred_at,amount,asset,from,to,transaction_hash,paging_token,watch_id,payload\r\n',
+    );
+
+    try {
+      await this.monitorService.streamSearchEventsCsv(
+        user.id,
+        query,
+        (values) => {
+          reply.raw.write(
+            `${values.map((value) => this.csvEscape(value)).join(',')}\r\n`,
+          );
+        },
+        () => {
+          if (!reply.raw.writableEnded) reply.raw.end();
+        },
+      );
+    } catch (err) {
+      this.logger.error(
+        `CSV export failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      if (!reply.raw.writableEnded) reply.raw.end();
+    }
+  }
+
+  /** RFC 4180 quoting for a single CSV field. */
+  private csvEscape(value: string | number | null): string {
+    if (value === null || value === undefined) return '';
+    const str = String(value);
+    if (/[",\r\n]/.test(str)) {
+      return `"${str.replace(/"/g, '""')}"`;
+    }
+    return str;
+  }
+
+  /** Reject non-ISO date filters with 400 before they reach the service. */
+  private assertIsoDate(value: string | undefined, label: string): void {
+    if (value === undefined) return;
+    const isoDate =
+      /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?)?$/;
+    if (!isoDate.test(value) || Number.isNaN(Date.parse(value))) {
+      throw new BadRequestException(`Invalid ISO date for "${label}"`);
+    }
   }
 }

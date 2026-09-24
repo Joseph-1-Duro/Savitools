@@ -190,7 +190,7 @@ function SequenceRunner({
 }
 
 export function ComposerTool() {
-  const { network } = useNetwork();
+  const { network, horizonUrl, networkPassphrase } = useNetwork();
   const { registerContextActions } = useCommandPalette();
 
   // Mode switcher: Builder vs Benchmark
@@ -812,6 +812,9 @@ export function ComposerTool() {
             <SignSubmitDialog
               xdr={xdr}
               network={network}
+              horizonUrl={horizonUrl}
+              networkPassphrase={networkPassphrase}
+              sourceAccount={sourceAccount.trim() || undefined}
               onClose={() => setShowSignDialog(false)}
               onSuccess={handleSignSubmitSuccess}
               onError={handleSignSubmitError}
