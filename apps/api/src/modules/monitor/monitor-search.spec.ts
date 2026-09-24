@@ -66,6 +66,7 @@ function makeService(watchEvents: WatchEvent[]) {
       {} as WatchRegistry,
       {} as StreamManager,
       {} as MonitorQueueService,
+      {} as any,
     ),
   };
 }

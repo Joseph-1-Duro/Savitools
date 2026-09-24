@@ -29,6 +29,7 @@ import {
 } from './monitor.types';
 import { StreamManager } from './stream-manager.service';
 import { WatchRegistry } from './watch-registry.service';
+import { EncryptionService, ENCRYPTION_PURPOSES } from '../../common/encryption.service';
 
 @Injectable()
 export class MonitorService implements OnApplicationBootstrap {
@@ -44,6 +45,7 @@ export class MonitorService implements OnApplicationBootstrap {
     private readonly registry: WatchRegistry,
     private readonly streamManager: StreamManager,
     private readonly queue: MonitorQueueService,
+    private readonly encryptionService: EncryptionService,
   ) {}
 
   async onApplicationBootstrap(): Promise<void> {
@@ -366,16 +368,28 @@ export class MonitorService implements OnApplicationBootstrap {
     userId: string,
     dto: RegisterWebhookDto,
   ): Promise<Pick<MonitorWebhook, 'id' | 'url' | 'enabled' | 'createdAt'>> {
+    const { encrypted, iv, authTag } = this.encryptionService.encryptForUser(
+      userId,
+      dto.secret,
+      ENCRYPTION_PURPOSES.MONITOR_WEBHOOK_SECRET,
+    );
+
     let webhook = await this.webhookRepository.findOne({ where: { userId } });
     if (webhook) {
       webhook.url = dto.url;
-      webhook.secret = dto.secret;
+      webhook.secret = encrypted;
+      webhook.iv = iv;
+      webhook.authTag = authTag;
+      webhook.secretVersion = 2;
       webhook.enabled = true;
     } else {
       webhook = this.webhookRepository.create({
         userId,
         url: dto.url,
-        secret: dto.secret,
+        secret: encrypted,
+        iv,
+        authTag,
+        secretVersion: 2,
         enabled: true,
       });
     }

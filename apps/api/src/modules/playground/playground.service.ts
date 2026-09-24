@@ -8,7 +8,7 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
-import { createCipheriv, createDecipheriv, pbkdf2Sync, randomBytes } from 'crypto';
+import { createDecipheriv, pbkdf2Sync } from 'crypto';
 import { Repository } from 'typeorm';
 import { SaveApiKeyDto } from './dto/save-api-key.dto';
 import { UpdateApiKeyDto } from './dto/update-api-key.dto';
@@ -18,6 +18,7 @@ import { PlaygroundHistory } from './entities/playground-history.entity';
 import { ProxyRequestDto } from './dto/proxy-request.dto';
 import { AuthService } from '../auth/auth.service';
 import { assertRelativePath, assertSafeDestination, MAX_PROXY_REDIRECTS } from './ssrf-guard';
+import { EncryptionService, ENCRYPTION_PURPOSES } from '../../common/encryption.service';
 
 interface CachedSpec {
   spec: Record<string, unknown>;
@@ -42,7 +43,6 @@ export interface DiffEntry {
 
 const ALGORITHM = 'aes-256-gcm';
 const KEY_LENGTH = 32;
-const IV_LENGTH = 16;
 const PBKDF2_ITERATIONS = 100_000;
 const SPEC_SALT = 'savitools-playground-spec-cache';
 
@@ -59,6 +59,7 @@ export class PlaygroundService {
     private readonly historyRepository: Repository<PlaygroundHistory>,
     private readonly configService: ConfigService,
     private readonly authService: AuthService,
+    private readonly encryptionService: EncryptionService,
   ) {
     this.specTtlMs = this.configService.get<number>('PLAYGROUND_SPEC_TTL_MS', 3_600_000);
   }
@@ -118,11 +119,7 @@ export class PlaygroundService {
       return this.executeProxyRequest(userId, dto, vaultKey, baseUrl);
     }
 
-    const decryptedKey = this.decrypt(
-      apiKeyRecord.encryptedKey,
-      apiKeyRecord.iv,
-      apiKeyRecord.authTag,
-    );
+    const decryptedKey = await this.decryptAndUpgrade(userId, apiKeyRecord);
     return this.executeProxyRequest(userId, dto, decryptedKey, baseUrl);
   }
 
@@ -327,7 +324,11 @@ export class PlaygroundService {
       );
     }
 
-    const { encrypted, iv, authTag } = this.encrypt(dto.apiKey);
+    const { encrypted, iv, authTag } = this.encryptionService.encryptForUser(
+      userId,
+      dto.apiKey,
+      ENCRYPTION_PURPOSES.PLAYGROUND_API_KEY,
+    );
 
     const key = this.apiKeysRepository.create({
       userId,
@@ -336,6 +337,7 @@ export class PlaygroundService {
       encryptedKey: encrypted,
       iv,
       authTag,
+      keyVersion: 2,
     });
 
     const saved = await this.apiKeysRepository.save(key);
@@ -348,17 +350,19 @@ export class PlaygroundService {
       order: { createdAt: 'DESC' },
     });
 
-    return keys.map((key) => {
-      const decrypted = this.decrypt(key.encryptedKey, key.iv, key.authTag);
-      const masked = decrypted.slice(0, 8) + '...' + decrypted.slice(-4);
-      return {
-        id: key.id,
-        label: key.label,
-        provider: key.provider,
-        maskedKey: masked,
-        createdAt: key.createdAt,
-      };
-    });
+    return Promise.all(
+      keys.map(async (key) => {
+        const decrypted = await this.decryptAndUpgrade(userId, key);
+        const masked = decrypted.slice(0, 8) + '...' + decrypted.slice(-4);
+        return {
+          id: key.id,
+          label: key.label,
+          provider: key.provider,
+          maskedKey: masked,
+          createdAt: key.createdAt,
+        };
+      }),
+    );
   }
 
   async deleteKey(id: string, userId: string): Promise<void> {
@@ -390,10 +394,15 @@ export class PlaygroundService {
     }
 
     if (dto.apiKey !== undefined) {
-      const { encrypted, iv, authTag } = this.encrypt(dto.apiKey);
+      const { encrypted, iv, authTag } = this.encryptionService.encryptForUser(
+        userId,
+        dto.apiKey,
+        ENCRYPTION_PURPOSES.PLAYGROUND_API_KEY,
+      );
       key.encryptedKey = encrypted;
       key.iv = iv;
       key.authTag = authTag;
+      key.keyVersion = 2;
     }
 
     const saved = await this.apiKeysRepository.save(key);
@@ -416,25 +425,16 @@ export class PlaygroundService {
     }
   }
 
-  private deriveKey(): Buffer {
+  /** Legacy scheme (pre-encryption-centralization): a single global key derived
+   *  from JWT_SECRET, shared across every user. Kept only to decrypt rows that
+   *  have not yet been upgraded — see {@link decryptAndUpgrade}. */
+  private legacyDeriveKey(): Buffer {
     const secret = this.configService.getOrThrow<string>('JWT_SECRET');
     return pbkdf2Sync(secret, SPEC_SALT, PBKDF2_ITERATIONS, KEY_LENGTH, 'sha512');
   }
 
-  private encrypt(plaintext: string): { encrypted: string; iv: string; authTag: string } {
-    const key = this.deriveKey();
-    const iv = randomBytes(IV_LENGTH);
-    const cipher = createCipheriv(ALGORITHM, key, iv);
-
-    let encrypted = cipher.update(plaintext, 'utf8', 'hex');
-    encrypted += cipher.final('hex');
-    const authTag = cipher.getAuthTag().toString('hex');
-
-    return { encrypted, iv: iv.toString('hex'), authTag };
-  }
-
-  private decrypt(encrypted: string, ivHex: string, authTagHex: string): string {
-    const key = this.deriveKey();
+  private legacyDecrypt(encrypted: string, ivHex: string, authTagHex: string): string {
+    const key = this.legacyDeriveKey();
     const iv = Buffer.from(ivHex, 'hex');
     const authTag = Buffer.from(authTagHex, 'hex');
     const decipher = createDecipheriv(ALGORITHM, key, iv);
@@ -443,6 +443,38 @@ export class PlaygroundService {
     let decrypted = decipher.update(encrypted, 'hex', 'utf8');
     decrypted += decipher.final('utf8');
     return decrypted;
+  }
+
+  /**
+   * Decrypt an API key, transparently re-encrypting it under the new
+   * per-user, purpose-bound scheme if it is still on the legacy global key.
+   * Idempotent and safe to retry: once a row is `keyVersion: 2` this is a
+   * no-op read.
+   */
+  private async decryptAndUpgrade(userId: string, key: ApiKey): Promise<string> {
+    if (key.keyVersion === 2) {
+      return this.encryptionService.decryptForUser(
+        userId,
+        { encrypted: key.encryptedKey, iv: key.iv, authTag: key.authTag },
+        ENCRYPTION_PURPOSES.PLAYGROUND_API_KEY,
+      );
+    }
+
+    const plaintext = this.legacyDecrypt(key.encryptedKey, key.iv, key.authTag);
+
+    const upgraded = this.encryptionService.encryptForUser(
+      userId,
+      plaintext,
+      ENCRYPTION_PURPOSES.PLAYGROUND_API_KEY,
+    );
+    await this.apiKeysRepository.update(key.id, {
+      encryptedKey: upgraded.encrypted,
+      iv: upgraded.iv,
+      authTag: upgraded.authTag,
+      keyVersion: 2,
+    });
+
+    return plaintext;
   }
 }
 

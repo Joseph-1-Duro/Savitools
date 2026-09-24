@@ -29,6 +29,20 @@ export class MonitorWebhook {
   @Column({ type: 'text', select: false })
   secret!: string;
 
+  @Column({ type: 'text', select: false, nullable: true })
+  iv!: string | null;
+
+  @Column({ name: 'auth_tag', type: 'text', select: false, nullable: true })
+  authTag!: string | null;
+
+  /**
+   * 1 = legacy scheme (secret stored as plaintext).
+   * 2 = AES-256-GCM ciphertext, per-user key derived from ENCRYPTION_SECRET.
+   * Legacy rows are transparently re-encrypted to version 2 on first read.
+   */
+  @Column({ name: 'secret_version', default: 1 })
+  secretVersion!: number;
+
   @Column({ default: true })
   enabled!: boolean;
 

@@ -42,6 +42,14 @@ export class ApiKey {
   @Column({ name: 'auth_tag' })
   authTag!: string;
 
+  /**
+   * 1 = legacy scheme (global key derived from JWT_SECRET via PBKDF2).
+   * 2 = per-user key derived from ENCRYPTION_SECRET via HKDF (EncryptionService).
+   * Legacy rows are transparently re-encrypted to version 2 on first read.
+   */
+  @Column({ name: 'key_version', default: 1 })
+  keyVersion!: number;
+
   @CreateDateColumn({ name: 'created_at' })
   createdAt!: Date;
 }
