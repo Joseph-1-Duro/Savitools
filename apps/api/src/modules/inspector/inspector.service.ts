@@ -4,6 +4,14 @@ import * as StellarSdk from '@stellar/stellar-sdk';
 import { CSV_BOM, toCsv } from '../../common/csv';
 import { decodeOperation, DecodedOperation } from './operation-decoder';
 import { explainOpCode, explainTxCode } from './result-codes';
+import {
+  DecodedSorobanEvent,
+  GroupedSorobanEvents,
+  SorobanEventFilter,
+  filterSorobanEvents,
+  groupSorobanEventsByContract,
+  parseSorobanEventsFromMeta,
+} from './event-parser';
 
 export interface DecodedEffect {
   type: string;
@@ -36,9 +44,19 @@ export interface TransactionBreakdown {
   resultExplanation: string;
   operationCount: number;
   operations: DecodedOperationResult[];
+  /** Decoded Soroban contract events from result_meta_xdr (may be empty). */
+  sorobanEvents: DecodedSorobanEvent[];
   rawJson: Record<string, unknown> | null;
   network: string;
   composerPayload: ComposerPayload | null;
+}
+
+export interface TransactionEventsResponse {
+  hash: string;
+  network: string;
+  count: number;
+  events: DecodedSorobanEvent[];
+  grouped: GroupedSorobanEvents[];
 }
 
 export interface TxSummary {
@@ -138,6 +156,10 @@ export class InspectorService {
 
     const txResultCode = this.extractTxResultCode(horizonTx.result_xdr, passphrase) ?? 'tx_success';
 
+    const sorobanEvents = parseSorobanEventsFromMeta(
+      (horizonTx as unknown as { result_meta_xdr?: string }).result_meta_xdr,
+    );
+
     return {
       hash: horizonTx.hash,
       ledger: (horizonTx as any).ledger_attr ?? (horizonTx as any).ledger ?? 0,
@@ -155,9 +177,44 @@ export class InspectorService {
       resultExplanation: explainTxCode(txResultCode),
       operationCount: horizonTx.operation_count,
       operations,
+      sorobanEvents,
       rawJson: horizonTx as unknown as Record<string, unknown>,
       network,
       composerPayload: this.buildComposerPayload(horizonTx, xdrOps, network),
+    };
+  }
+
+  // ─── GET /inspector/tx/:hash/events ───────────────────────────────────────
+
+  async getTransactionEvents(
+    hash: string,
+    network: 'testnet' | 'mainnet' = 'testnet',
+    filter: SorobanEventFilter = {},
+  ): Promise<TransactionEventsResponse> {
+    const server = this.horizon(network);
+
+    let horizonTx: StellarSdk.Horizon.ServerApi.TransactionRecord;
+    try {
+      horizonTx = await server.transactions().transaction(hash).call();
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('404') || msg.includes('not found')) {
+        throw new NotFoundException(`Transaction ${hash} not found on ${network}`);
+      }
+      throw new BadRequestException(`Horizon error: ${msg}`);
+    }
+
+    const all = parseSorobanEventsFromMeta(
+      (horizonTx as unknown as { result_meta_xdr?: string }).result_meta_xdr,
+    );
+    const events = filterSorobanEvents(all, filter);
+
+    return {
+      hash: horizonTx.hash,
+      network,
+      count: events.length,
+      events,
+      grouped: groupSorobanEventsByContract(events),
     };
   }
 
@@ -316,6 +373,7 @@ export class InspectorService {
       resultExplanation: 'Transaction decoded from XDR — not yet submitted.',
       operationCount: xdrOps.length,
       operations,
+      sorobanEvents: [],
       rawJson: null,
       network,
       composerPayload: this.buildComposerPayload(null, xdrOps, network, innerTx),

@@ -5,6 +5,7 @@ import {
   downloadCsv,
   getAccountTransactions,
   inspectTransaction,
+  type DecodedSorobanEvent,
   type TransactionBreakdown,
   type TxSummary,
 } from '@/lib/api';
@@ -180,6 +181,133 @@ function OperationCard({ op, index, copied, copy }: {
   );
 }
 
+// ─── Soroban events panel ─────────────────────────────────────────────────
+
+function formatScValBrief(val: DecodedSorobanEvent['data']): string {
+  if (!val) return '—';
+  const { value } = val;
+  if (value === null || value === undefined) return val.type;
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return String(value);
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return val.raw || val.type;
+  }
+}
+
+function SorobanEventsPanel({ events }: { events: DecodedSorobanEvent[] }) {
+  const [contractFilter, setContractFilter] = useState('');
+  const [nameFilter, setNameFilter] = useState('');
+
+  const filtered = events.filter((ev) => {
+    if (contractFilter.trim()) {
+      const needle = contractFilter.trim().toLowerCase();
+      if (!(ev.contractId ?? '').toLowerCase().includes(needle)) return false;
+    }
+    if (nameFilter.trim()) {
+      const needle = nameFilter.trim().toLowerCase();
+      const hay = [
+        ev.eventName ?? '',
+        ev.signature,
+        ev.topics[0]?.friendlyName ?? '',
+        typeof ev.topics[0]?.value?.value === 'string' ? String(ev.topics[0].value.value) : '',
+        ev.topics[0]?.rawHex ?? '',
+      ]
+        .join(' ')
+        .toLowerCase();
+      if (!hay.includes(needle)) return false;
+    }
+    return true;
+  });
+
+  const grouped = filtered.reduce<Record<string, DecodedSorobanEvent[]>>((acc, ev) => {
+    const key = ev.contractId ?? '_unknown';
+    (acc[key] ??= []).push(ev);
+    return acc;
+  }, {});
+
+  if (events.length === 0) return null;
+
+  return (
+    <div>
+      <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
+        <h2 className="text-sm font-semibold text-muted-foreground uppercase tracking-wider">
+          Soroban Events ({filtered.length}/{events.length})
+        </h2>
+        <div className="flex flex-wrap gap-2">
+          <input
+            type="text"
+            value={contractFilter}
+            onChange={(e) => setContractFilter(e.target.value)}
+            placeholder="Filter contract ID"
+            className="text-xs font-mono rounded-md border border-border bg-background px-2 py-1.5 w-44"
+          />
+          <input
+            type="text"
+            value={nameFilter}
+            onChange={(e) => setNameFilter(e.target.value)}
+            placeholder="Filter event name"
+            className="text-xs font-mono rounded-md border border-border bg-background px-2 py-1.5 w-40"
+          />
+        </div>
+      </div>
+
+      {filtered.length === 0 ? (
+        <p className="text-xs text-muted-foreground">No events match the current filters.</p>
+      ) : (
+        <div className="space-y-4">
+          {Object.entries(grouped).map(([contractId, group]) => (
+            <div key={contractId} className="rounded-lg border border-border bg-background p-4 space-y-3">
+              <div className="text-xs font-mono text-muted-foreground break-all">
+                {contractId === '_unknown' ? 'Unknown contract' : contractId}
+              </div>
+              {group.map((ev) => (
+                <div key={ev.index} className="rounded-md border border-border/60 bg-muted/20 p-3 space-y-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-xs font-mono bg-muted rounded px-1.5 py-0.5">#{ev.index}</span>
+                    <span className="text-sm font-medium font-mono">{ev.signature}</span>
+                    {ev.partial && (
+                      <span className="text-[10px] uppercase tracking-wide text-amber-400 bg-amber-400/10 rounded px-1.5 py-0.5">
+                        partial
+                      </span>
+                    )}
+                    {!ev.inSuccessfulContractCall && (
+                      <span className="text-[10px] uppercase tracking-wide text-red-400 bg-red-400/10 rounded px-1.5 py-0.5">
+                        failed call
+                      </span>
+                    )}
+                  </div>
+                  <div className="space-y-1">
+                    {ev.topics.map((t) => (
+                      <div key={t.index} className="grid grid-cols-[88px_1fr] gap-x-2 text-xs">
+                        <span className="text-muted-foreground">topic[{t.index}]</span>
+                        <span className="font-mono break-all">
+                          {t.friendlyName ?? (
+                            <span className="text-muted-foreground">0x{t.rawHex || '—'}</span>
+                          )}
+                          {t.value && t.friendlyName && (
+                            <span className="text-muted-foreground"> · {formatScValBrief(t.value)}</span>
+                          )}
+                        </span>
+                      </div>
+                    ))}
+                    <div className="grid grid-cols-[88px_1fr] gap-x-2 text-xs">
+                      <span className="text-muted-foreground">data</span>
+                      <span className="font-mono break-all">{formatScValBrief(ev.data)}</span>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── Transaction breakdown view ───────────────────────────────────────────
 
 function TxBreakdown({ data, onInspectInComposer }: {
@@ -295,6 +423,9 @@ function TxBreakdown({ data, onInspectInComposer }: {
           ))}
         </div>
       </div>
+
+      {/* Soroban events (grouped by contract, with topic filters) */}
+      <SorobanEventsPanel events={data.sorobanEvents ?? []} />
 
       {/* Raw JSON toggle */}
       {data.rawJson && (
