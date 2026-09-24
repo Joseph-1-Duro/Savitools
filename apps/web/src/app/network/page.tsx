@@ -124,7 +124,14 @@ export default function NetworkStatusPage() {
       const defaultProfile = data.find((p) => p.isDefault);
       if (defaultProfile) {
         setActiveProfileId(defaultProfile.id);
-        setNetwork(defaultProfile.horizonUrl);
+        // Status/history endpoints only accept built-in networks; resolve the
+        // default profile to its matching built-in network instead of feeding
+        // its Horizon URL into NetworkChoice (same rule as handleNetworkChange).
+        if (defaultProfile.networkPassphrase === MAINNET_PASSPHRASE) {
+          setNetwork("mainnet");
+        } else if (defaultProfile.networkPassphrase === TESTNET_PASSPHRASE) {
+          setNetwork("testnet");
+        }
       }
     } catch (err) {
       console.error(err);

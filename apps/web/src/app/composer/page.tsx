@@ -2,6 +2,7 @@ import { SiteHeader } from '@/components/layout/site-header';
 import { ComposerTool } from '@/components/tools/other-tools';
 import { ToolPageShell } from '@/components/tools/tool-page-shell';
 import { ErrorBoundary } from '@/components/tools/error-boundary';
+import { Suspense } from 'react';
 
 export default function ComposerPage() {
   return (
@@ -12,9 +13,11 @@ export default function ComposerPage() {
         description="Visual builder for multi-operation Stellar transactions."
         docsHref="/docs/composer"
       >
-        <ErrorBoundary toolName="Composer">
-          <ComposerTool />
-        </ErrorBoundary>
+        <Suspense fallback={<p className="text-sm text-muted-foreground">Loading…</p>}>
+          <ErrorBoundary toolName="Composer">
+            <ComposerTool />
+          </ErrorBoundary>
+        </Suspense>
       </ToolPageShell>
     </>
   );

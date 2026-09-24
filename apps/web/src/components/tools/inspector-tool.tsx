@@ -492,6 +492,8 @@ export function InspectorTool() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const { network } = useNetwork();
+  // Inspector endpoints only accept the built-in networks.
+  const apiNetwork = network === 'mainnet' ? 'mainnet' : 'testnet';
   const { registerContextActions } = useCommandPalette();
 
   const initialInput = searchParams.get('hash') ?? searchParams.get('address') ?? searchParams.get('xdr') ?? '';
@@ -518,7 +520,7 @@ export function InspectorTool() {
 
     try {
       if (type === 'hash') {
-        const data = await inspectTransaction(v, network);
+        const data = await inspectTransaction(v, apiNetwork);
         setTxData(data);
         markStepComplete('inspect');
         addRecentItem({
@@ -528,7 +530,7 @@ export function InspectorTool() {
           href: `/inspector?hash=${data.hash}`,
         });
       } else if (type === 'address') {
-        const txs = await getAccountTransactions(v, network);
+        const txs = await getAccountTransactions(v, apiNetwork);
         setAccountTxs(txs);
         markStepComplete('inspect');
         addRecentItem({
@@ -538,7 +540,7 @@ export function InspectorTool() {
           href: `/inspector?address=${v}`,
         });
       } else if (type === 'xdr') {
-        const data = await decodeXdr(v, network);
+        const data = await decodeXdr(v, apiNetwork);
         setTxData(data);
         markStepComplete('inspect');
         addRecentItem({

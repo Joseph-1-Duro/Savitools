@@ -3,6 +3,7 @@
 import {
   buildTransaction,
   fetchOperations,
+  FeeBumpResult,
   OperationManifestEntry,
   simulateTransaction,
   SimulateTransactionResult,
@@ -11,6 +12,7 @@ import { useNetwork } from '@/lib/network-context';
 import { addRecentItem } from '@/lib/recent-items';
 import { useCommandPalette } from '@/components/command-palette';
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { useSearchParams } from 'next/navigation';
 import { ComposerToolbar } from './composer-toolbar';
 import { OperationPalette } from './operation-palette';
 import { OperationList } from './operation-list';
@@ -19,6 +21,15 @@ import { XdrPreview } from './xdr-preview';
 import { SimulateResult } from './simulate-result';
 import { SignSubmitDialog } from './sign-submit-dialog';
 import { BenchmarkPanel } from './benchmark-panel';
+import {
+  PreconditionsPanel,
+  PreconditionFields,
+  PreconditionKind,
+  DEFAULT_PRECONDITION_FIELDS,
+  toPreconditions,
+  validatePreconditions,
+} from './preconditions-panel';
+import { FeeBumpPanel } from './fee-bump-panel';
 import { ComposerOperationListSkeleton } from '../state-display';
 import { ErrorState } from '../state-display';
 import { Code2, Zap, Save, Download, Upload, Share2, Trash2, Copy, Clock, FolderOpen, ListOrdered } from 'lucide-react';
@@ -29,6 +40,11 @@ export interface ComposedOperation {
   fields: Record<string, unknown>;
 }
 
+export interface PreconditionDraft {
+  kind: PreconditionKind;
+  fields: PreconditionFields;
+}
+
 export interface Workspace {
   id: string;
   ownerId: string;
@@ -37,6 +53,7 @@ export interface Workspace {
     sourceAccount: string;
     memo: string;
     operations: ComposedOperation[];
+    preconditions?: PreconditionDraft | null;
   };
   createdAt: string;
   updatedAt: string;
@@ -111,14 +128,15 @@ function SequenceRunner({
     for (let i = 0; i < allSteps.length; i++) {
       const ops = allSteps[i];
       try {
+        const apiNetwork = network === 'mainnet' ? 'mainnet' : 'testnet';
         const payload = {
           sourceAccount: currentSource.trim(),
           memo: memo.trim() || undefined,
-          operations: ops.map((op) => ({ type: op.type, fields: op.fields })),
-          network,
+          operations: ops.map((op) => ({ type: op.type, ...op.fields })),
+          network: apiNetwork,
         };
         const built = await buildTransaction(payload);
-        const sim = (await simulateTransaction({ xdr: built.xdr, network })) as any;
+        const sim = (await simulateTransaction({ xdr: built.xdr, network: apiNetwork })) as any;
         const status = sim?.success ? 'success' : 'failed';
         setResults((prev) => [...prev, { step: i + 1, hash: sim?.hash, status, next: sim?.nextSequence }]);
         if (stopOnFailure && !sim?.success) break;
@@ -207,6 +225,17 @@ export function ComposerTool() {
   const [operations, setOperations] = useState<ComposedOperation[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
 
+  // Preconditions draft (Savitura/Savitools#208)
+  const [precondKind, setPrecondKind] = useState<PreconditionKind>('none');
+  const [precondFields, setPrecondFields] = useState<PreconditionFields>(DEFAULT_PRECONDITION_FIELDS);
+
+  // Fee-bump result (Savitura/Savitools#207) — its XDR shares the preview/sign path
+  const [feeBumpResult, setFeeBumpResult] = useState<FeeBumpResult | null>(null);
+
+  // URL prefill (e.g. "send to Composer" from Order Book quotes)
+  const searchParams = useSearchParams();
+  const prefilled = useRef(false);
+
   // Workspace state
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [activeWorkspaceId, setActiveWorkspaceId] = useState<string | null>(null);
@@ -256,24 +285,38 @@ export function ComposerTool() {
   }, [loadManifest]);
 
   // ---------------------------------------------------------------------------
-  // Rebuild XDR when operations / source / memo change (debounced 300ms)
+  // Rebuild XDR when operations / source / memo / preconditions change (debounced 300ms)
   // ---------------------------------------------------------------------------
   const rebuildXdr = useCallback(
-    async (ops: ComposedOperation[], src: string, mem: string) => {
+    async (
+      ops: ComposedOperation[],
+      src: string,
+      mem: string,
+      kind: PreconditionKind,
+      fields: PreconditionFields,
+    ) => {
       if (!src.trim() || ops.length === 0) {
         setXdr(null);
         return;
       }
+      if (validatePreconditions(kind, fields)) {
+        // Field-level validation keeps an invalid draft out of the build path.
+        setXdr(null);
+        return;
+      }
+      const precondition = toPreconditions(kind, fields);
       setXdrBuilding(true);
       try {
         const payload = {
           sourceAccount: src.trim(),
           memo: mem.trim() || undefined,
-          operations: ops.map((op) => ({ type: op.type, fields: op.fields })),
-          network,
+          operations: ops.map((op) => ({ type: op.type, ...op.fields })),
+          preconditions: precondition ? [precondition] : undefined,
+          network: network === 'mainnet' ? 'mainnet' : 'testnet',
         };
         const built = await buildTransaction(payload);
         setXdr(built.xdr);
+        setFeeBumpResult(null);
       } catch {
         setXdr(null);
       } finally {
@@ -286,12 +329,36 @@ export function ComposerTool() {
   useEffect(() => {
     if (buildDebounce.current) clearTimeout(buildDebounce.current);
     buildDebounce.current = setTimeout(() => {
-      void rebuildXdr(operations, sourceAccount, memo);
+      void rebuildXdr(operations, sourceAccount, memo, precondKind, precondFields);
     }, 300);
     return () => {
       if (buildDebounce.current) clearTimeout(buildDebounce.current);
     };
-  }, [operations, sourceAccount, memo, rebuildXdr]);
+  }, [operations, sourceAccount, memo, precondKind, precondFields, rebuildXdr]);
+
+  // ---------------------------------------------------------------------------
+  // URL prefill — receives estimates from other tools (e.g. Order Book quote)
+  // ---------------------------------------------------------------------------
+  useEffect(() => {
+    if (prefilled.current) return;
+    prefilled.current = true;
+    if (searchParams.get('prefillOp') !== 'payment') return;
+    const amount = searchParams.get('amount');
+    if (!amount) return;
+    const code = searchParams.get('assetCode');
+    const issuer = searchParams.get('assetIssuer');
+    const op: ComposedOperation = {
+      id: newId(),
+      type: 'payment',
+      fields: {
+        destination: searchParams.get('destination') ?? '',
+        asset: issuer ? { code: code || 'XLM', issuer } : { code: code || 'native' },
+        amount,
+      },
+    };
+    setOperations((prev) => [...prev, op]);
+    setSelectedId(op.id);
+  }, [searchParams]);
 
   // ---------------------------------------------------------------------------
   // Operation handlers
@@ -340,13 +407,30 @@ export function ComposerTool() {
     sourceAccount,
     memo,
     operations,
+    preconditions:
+      precondKind === 'none'
+        ? null
+        : ({ kind: precondKind, fields: precondFields } satisfies PreconditionDraft),
   });
 
-  const applyComposerState = (state: { sourceAccount: string; memo: string; operations: ComposedOperation[] }) => {
+  const applyComposerState = (state: {
+    sourceAccount: string;
+    memo: string;
+    operations: ComposedOperation[];
+    preconditions?: PreconditionDraft | null;
+  }) => {
     setSourceAccount(state.sourceAccount || '');
     setMemo(state.memo || '');
     setOperations(state.operations || []);
     setSelectedId(null);
+    const draft = state.preconditions;
+    if (draft && draft.kind && draft.kind !== 'none' && draft.fields) {
+      setPrecondKind(draft.kind);
+      setPrecondFields({ ...DEFAULT_PRECONDITION_FIELDS, ...draft.fields });
+    } else {
+      setPrecondKind('none');
+      setPrecondFields(DEFAULT_PRECONDITION_FIELDS);
+    }
   };
 
   const saveWorkspace = () => {
@@ -447,7 +531,12 @@ export function ComposerTool() {
           id: newId(),
           ownerId: parsed.ownerId || 'local-user',
           name: parsed.name,
-          composerState: { sourceAccount: state.sourceAccount, memo: typeof state.memo === 'string' ? state.memo : '', operations },
+          composerState: {
+            sourceAccount: state.sourceAccount,
+            memo: typeof state.memo === 'string' ? state.memo : '',
+            operations,
+            preconditions: state.preconditions ?? null,
+          },
           createdAt: parsed.createdAt || now,
           updatedAt: now,
         };
@@ -479,7 +568,10 @@ export function ComposerTool() {
     setSimError(null);
     setSimResult(null);
     try {
-      const result = await simulateTransaction({ xdr, network });
+      const result = await simulateTransaction({
+        xdr,
+        network: network === 'mainnet' ? 'mainnet' : 'testnet',
+      });
       setSimResult(result);
       addRecentItem({
         category: 'composer',
@@ -706,7 +798,10 @@ export function ComposerTool() {
       )}
 
       {mode === 'benchmark' ? (
-        <BenchmarkPanel xdr={xdr || ''} network={network} />
+        <BenchmarkPanel
+          xdr={xdr || ''}
+          network={network === 'mainnet' ? 'mainnet' : 'testnet'}
+        />
       ) : mode === 'sequence' ? (
         <SequenceRunner
           operations={operations}
@@ -753,6 +848,14 @@ export function ComposerTool() {
             />
           </div>
 
+          {/* Preconditions (Savitura/Savitools#208) */}
+          <PreconditionsPanel
+            kind={precondKind}
+            fields={precondFields}
+            onKindChange={setPrecondKind}
+            onFieldChange={setPrecondFields}
+          />
+
           {/* 3-column composer area */}
           <div className="grid grid-cols-1 md:grid-cols-[200px_1fr_280px] gap-4 min-h-[400px]">
             {/* Left — palette */}
@@ -796,6 +899,17 @@ export function ComposerTool() {
             </div>
           </div>
 
+          {/* Fee-bump build mode (Savitura/Savitools#207) */}
+          <FeeBumpPanel
+            network={network === 'mainnet' ? 'mainnet' : 'testnet'}
+            onResult={(result) => {
+              setFeeBumpResult(result);
+              setXdr(result.xdr);
+              setSimResult(null);
+              setSimError(null);
+            }}
+          />
+
           {/* XDR preview */}
           <XdrPreview xdr={xdr} loading={xdrBuilding} />
 
@@ -814,7 +928,11 @@ export function ComposerTool() {
               network={network}
               horizonUrl={horizonUrl}
               networkPassphrase={networkPassphrase}
-              sourceAccount={sourceAccount.trim() || undefined}
+              sourceAccount={
+                feeBumpResult && xdr === feeBumpResult.xdr
+                  ? feeBumpResult.feeSource
+                  : sourceAccount.trim() || undefined
+              }
               onClose={() => setShowSignDialog(false)}
               onSuccess={handleSignSubmitSuccess}
               onError={handleSignSubmitError}

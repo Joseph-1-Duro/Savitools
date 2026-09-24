@@ -1,13 +1,45 @@
 import { zeroBuffer } from '@/lib/secure-memory';
 
+/**
+ * Parse an XDR envelope as either a classic transaction or a fee-bump
+ * envelope (Savitura/Savitools#207). Both variants expose `sign`, `hash`,
+ * and `toXDR`, so callers can treat them uniformly.
+ */
+async function parseEnvelope(
+  unsignedXdr: string,
+  passphrase: string,
+): Promise<{
+  isFeeBump: boolean;
+  tx: {
+    sign: (keypair: unknown) => void;
+    toXDR: () => string;
+    source?: unknown;
+    feeSource?: string;
+  };
+}> {
+  const { Transaction, FeeBumpTransaction, xdr } = await import('@stellar/stellar-sdk');
+  let isFeeBump = false;
+  try {
+    isFeeBump =
+      xdr.TransactionEnvelope.fromXDR(unsignedXdr, 'base64').switch().name ===
+      'envelopeTypeTxFeeBump';
+  } catch {
+    isFeeBump = false;
+  }
+  const tx = isFeeBump
+    ? new FeeBumpTransaction(unsignedXdr, passphrase)
+    : new Transaction(unsignedXdr, passphrase);
+  return { isFeeBump, tx: tx as never };
+}
+
 export async function signTransactionXdr(
   unsignedXdr: string,
   secretKey: string,
   network: 'testnet' | 'mainnet',
 ): Promise<string> {
-  const { Keypair, Networks, Transaction } = await import('@stellar/stellar-sdk');
+  const { Keypair, Networks } = await import('@stellar/stellar-sdk');
   const passphrase = network === 'mainnet' ? Networks.PUBLIC : Networks.TESTNET;
-  const tx = new Transaction(unsignedXdr, passphrase);
+  const { tx } = await parseEnvelope(unsignedXdr, passphrase);
   const keypair = Keypair.fromSecret(secretKey);
   tx.sign(keypair);
 
@@ -123,11 +155,13 @@ export async function signWithWallet(
     );
   }
 
-  const { Transaction } = await import('@stellar/stellar-sdk');
-  const tx = new Transaction(unsignedXdr, options.networkPassphrase);
-  const source = tx.source as { accountId?: () => string };
-  const sourceAccount =
-    typeof source?.accountId === 'function' ? source.accountId() : String(tx.source);
+  const { isFeeBump, tx } = await parseEnvelope(unsignedXdr, options.networkPassphrase);
+  const sourceAccount = isFeeBump
+    ? String(tx.feeSource ?? '')
+    : (() => {
+        const source = tx.source as { accountId?: () => string } | undefined;
+        return typeof source?.accountId === 'function' ? source.accountId() : String(tx.source ?? '');
+      })();
 
   // Request access first so we can reject account mismatches before the
   // wallet popup opens.
@@ -167,11 +201,20 @@ export async function signWithWallet(
   }
 }
 
-function mapWalletError(err: unknown): WalletError {
+function mapWalletError(err: unknown, context?: string): WalletError {
+  // Freighter rejects with either Error instances or plain payloads like
+  // { code: 3, message: 'The user rejected the request' }, so read the
+  // message from both shapes before classifying.
+  const messageText =
+    typeof err === 'string'
+      ? err
+      : err instanceof Error
+        ? err.message
+        : typeof (err as { message?: unknown })?.message === 'string'
+          ? (err as { message: string }).message
+          : '';
   const text =
-    (typeof err === 'string' ? err : err instanceof Error ? err.message : '') +
-    ' ' +
-    String((err as { code?: unknown })?.code ?? '');
+    messageText + ' ' + String((err as { code?: unknown })?.code ?? '');
   if (/cancell?ed|dismissed|abort|close[ds]?\b/i.test(text)) {
     return new WalletError(
       'CANCELLED',
@@ -196,6 +239,6 @@ function mapWalletError(err: unknown): WalletError {
       ? err
       : err instanceof Error
         ? err.message
-        : 'Wallet signing failed.',
+        : context ?? 'Wallet signing failed.',
   );
 }

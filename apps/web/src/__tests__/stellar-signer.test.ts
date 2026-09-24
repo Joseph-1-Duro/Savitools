@@ -6,10 +6,11 @@ import {
 } from '@/lib/stellar-signer';
 import { submitSignedTransaction, submitToHorizon } from '@/lib/composer-api';
 import {
+  Account,
   Asset,
   Keypair,
-  Networks,
   Operation,
+  Networks,
   TransactionBuilder,
 } from '@stellar/stellar-sdk';
 
@@ -21,7 +22,7 @@ const mockFreighter = {
 
 function buildTestnetTransaction(sourcePublicKey: string): string {
   const destination = Keypair.random();
-  return new TransactionBuilder(sourcePublicKey, {
+  return new TransactionBuilder(new Account(sourcePublicKey, '0'), {
     fee: '100',
     networkPassphrase: Networks.TESTNET,
   })
@@ -54,8 +55,8 @@ describe('browser-wallet signing (Savitura/Savitools#198)', () => {
   });
 
   it('reports the wallet as unavailable when the extension is not installed', () => {
-    delete (globalThis as unknown as { window?: { freighterApi?: unknown } }).window
-      .freighterApi;
+    delete (globalThis as unknown as { window?: { freighterApi?: unknown } })
+      .window?.freighterApi;
     expect(isWalletAvailable()).toBe(false);
   });
 
@@ -141,8 +142,8 @@ describe('browser-wallet signing (Savitura/Savitools#198)', () => {
   });
 
   it('reports unsupported environments clearly', async () => {
-    delete (globalThis as unknown as { window?: { freighterApi?: unknown } }).window
-      .freighterApi;
+    delete (globalThis as unknown as { window?: { freighterApi?: unknown } })
+      .window?.freighterApi;
 
     await expect(
       signWithWallet('AAAAAA==', { networkPassphrase: Networks.TESTNET }),

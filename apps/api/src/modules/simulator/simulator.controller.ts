@@ -8,6 +8,7 @@ import { SimulateStrictSendDto } from './dto/strict-send.dto';
 import { SimulateStrictReceiveDto } from './dto/strict-receive.dto';
 import { SimulateFeeQueryDto } from './dto/simulate-fee.dto';
 import { OrderbookQueryDto } from './dto/orderbook.dto';
+import { TradesQueryDto, OrderQuoteDto } from './dto/trades.dto';
 
 @ApiTags('simulator')
 @Controller('simulator')
@@ -92,5 +93,21 @@ export class SimulatorController {
       query.buying,
       query.network ?? 'testnet',
     );
+  }
+
+  @Get('trades')
+  @ApiOperation({ summary: 'Get a paginated tape of executed DEX trades for an asset pair' })
+  @ApiResponse({ status: 200, description: 'Trade tape retrieved (empty array when no matches)' })
+  @ApiResponse({ status: 400, description: 'Invalid filters, asset, network, or Horizon unavailable' })
+  getTrades(@Query() query: TradesQueryDto) {
+    return this.orderbookService.getTrades(query);
+  }
+
+  @Post('orderbook/quote')
+  @ApiOperation({ summary: 'Walk the book for a trade size and estimate fills, fees, and price impact' })
+  @ApiResponse({ status: 201, description: 'Quote calculated' })
+  @ApiResponse({ status: 400, description: 'Invalid amount, asset pair, or network' })
+  getQuote(@Body() dto: OrderQuoteDto) {
+    return this.orderbookService.getQuote(dto);
   }
 }

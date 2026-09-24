@@ -156,7 +156,7 @@ export function GraphTool() {
           rootAccount: trimmed,
           depth: d,
           mode: m,
-          network,
+          network: network === 'mainnet' ? 'mainnet' : 'testnet',
         });
         setResult(res);
         setRootAccount(trimmed);

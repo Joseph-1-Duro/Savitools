@@ -8,15 +8,19 @@ import {
   Asset,
   BASE_FEE,
   Horizon,
+  Keypair,
   Memo,
   Networks,
   Operation,
+  StrKey,
   Transaction,
   TransactionBuilder,
+  xdr,
 } from '@stellar/stellar-sdk';
 import { BuildTransactionDto, OperationDto } from './dto/build-transaction.dto';
 import { SimulateTransactionDto } from './dto/simulate-transaction.dto';
 import { BenchmarkTransactionDto } from './dto/benchmark-transaction.dto';
+import { FeeBumpDto } from './dto/fee-bump.dto';
 
 // ---------------------------------------------------------------------------
 // Static operation-type manifest returned by GET /composer/operations
@@ -268,10 +272,19 @@ export class ComposerService {
         networkPassphrase: passphrase,
       });
 
+      if (dto.timeBounds && dto.preconditions && dto.preconditions.length > 0) {
+        throw new BadRequestException('timeBounds and preconditions are mutually exclusive');
+      }
+
       if (dto.timeBounds) {
         builder.setTimebounds(dto.timeBounds.minTime, dto.timeBounds.maxTime);
       } else if (dto.preconditions && dto.preconditions.length > 0) {
         this.applyPreconditions(builder, dto.preconditions);
+        const hasTimeBounds = dto.preconditions.some((p) => p.type === 'time_bounds');
+        if (!hasTimeBounds) {
+          // stellar-base requires time bounds whenever other preconditions are set
+          builder.setTimeout(0);
+        }
       } else {
         builder.setTimeout(30);
       }
@@ -302,6 +315,103 @@ export class ComposerService {
       }
       const message = err instanceof Error ? err.message : String(err);
       throw new BadRequestException(`Failed to build transaction: ${message}`);
+    }
+  }
+
+  async buildFeeBump(dto: FeeBumpDto) {
+    try {
+      const network = dto.network || 'testnet';
+      const passphrase = this.networkPassphrase(network);
+
+      let envelope: xdr.TransactionEnvelope;
+      try {
+        envelope = xdr.TransactionEnvelope.fromXDR(dto.innerXdr, 'base64');
+      } catch {
+        throw new BadRequestException('Invalid inner transaction XDR');
+      }
+
+      const envelopeType = envelope.switch().name;
+      if (envelopeType === 'envelopeTypeTxFeeBump') {
+        throw new BadRequestException(
+          'Inner envelope is already a fee-bump transaction',
+        );
+      }
+      if (envelopeType !== 'envelopeTypeTx' && envelopeType !== 'envelopeTypeTxV0') {
+        throw new BadRequestException(
+          'Inner envelope must be a classic transaction',
+        );
+      }
+      if (envelopeType === 'envelopeTypeTx' && Number(envelope.v1().tx().ext().switch()) !== 0) {
+        throw new BadRequestException(
+          'Soroban transactions cannot be fee-bumped',
+        );
+      }
+
+      if (!StrKey.isValidEd25519PublicKey(dto.feeSource)) {
+        throw new BadRequestException(
+          `Invalid fee source account: ${dto.feeSource}`,
+        );
+      }
+
+      let inner: Transaction;
+      try {
+        inner = new Transaction(dto.innerXdr, passphrase);
+      } catch {
+        throw new BadRequestException('Invalid inner transaction XDR');
+      }
+
+      const operationCount = inner.operations.length;
+      const baseFee = BigInt(dto.baseFee);
+      if (baseFee <= 0n) {
+        throw new BadRequestException('baseFee must be a positive integer');
+      }
+      if (baseFee * BigInt(operationCount) < BigInt(inner.fee)) {
+        throw new BadRequestException(
+          `baseFee is too low: ${baseFee} stroops x ${operationCount} operations must cover the inner fee of ${inner.fee} stroops`,
+        );
+      }
+
+      const maxTime = Number(inner.timeBounds?.maxTime ?? 0);
+      if (maxTime > 0 && maxTime * 1000 <= Date.now()) {
+        throw new BadRequestException('Inner transaction time bounds have expired');
+      }
+
+      if (inner.signatures.length > 0) {
+        const publicKey = Keypair.fromPublicKey(inner.source);
+        for (const signature of inner.signatures) {
+          const raw = signature.signature();
+          if (!raw || !publicKey.verify(inner.hash(), raw)) {
+            throw new BadRequestException(
+              'Network mismatch: inner transaction signatures are not valid for the requested network',
+            );
+          }
+        }
+      }
+
+      const feeBump = TransactionBuilder.buildFeeBumpTransaction(
+        dto.feeSource,
+        dto.baseFee,
+        inner,
+        passphrase,
+      );
+
+      return {
+        xdr: feeBump.toEnvelope().toXDR('base64'),
+        hash: feeBump.hash().toString('hex'),
+        innerHash: inner.hash().toString('hex'),
+        type: 'fee_bump' as const,
+        feeSource: dto.feeSource,
+        baseFee: dto.baseFee,
+        fee: (baseFee * BigInt(operationCount)).toString(),
+        operationCount,
+        network,
+      };
+    } catch (err: unknown) {
+      if (err instanceof BadRequestException) {
+        throw err;
+      }
+      const message = err instanceof Error ? err.message : String(err);
+      throw new BadRequestException(`Failed to build fee-bump: ${message}`);
     }
   }
 
@@ -625,6 +735,9 @@ export class ComposerService {
               'ledger_bounds precondition requires minLedger and maxLedger',
             );
           }
+          if (precondition.minLedger < 0 || precondition.maxLedger < 0) {
+            throw new BadRequestException('ledger bounds must be non-negative');
+          }
           if (precondition.minLedger > precondition.maxLedger) {
             throw new BadRequestException(
               'ledger_bounds minLedger must be less than or equal to maxLedger',
@@ -637,8 +750,8 @@ export class ComposerService {
             throw new BadRequestException('min_sequence precondition requires minSequence');
           }
           const minSeq = BigInt(precondition.minSequence);
-          if (minSeq < 0n) {
-            throw new BadRequestException('min_sequence must be non-negative');
+          if (minSeq <= 0n) {
+            throw new BadRequestException('minSequence must be a positive integer string');
           }
           builder.setMinAccountSequence(precondition.minSequence);
           if (precondition.minLedgerAge !== undefined) {
