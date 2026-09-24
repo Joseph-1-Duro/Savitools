@@ -24,6 +24,7 @@ SaviTools uses [GrantFox](https://grantfox.xyz) to fund and coordinate open-sour
    cp apps/api/.env.example apps/api/.env
    cp apps/web/.env.example apps/web/.env
    ```
+   `apps/api/.env.example` documents every runtime-read variable. At startup the API validates its configuration (`apps/api/src/config/env-validation.ts`) and fails fast with an aggregated error for missing required URLs, non-HTTPS public URLs in production, placeholder auth/encryption secrets, and enabled-but-misconfigured features — so keep the two templates and the validator in sync when you add variables.
 3. Start the entire local stack:
    ```bash
    make dev

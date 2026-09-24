@@ -119,11 +119,22 @@ cp .env.example .env
 | `STELLAR_NETWORK`        | Stellar network (`testnet` or `public`)               | `testnet`                                                 |
 | `STELLAR_HORIZON_URL`    | Horizon API URL                                       | `https://horizon-testnet.stellar.org`                     |
 | `STELLAR_RPC_URL`        | Soroban RPC URL                                       | `https://soroban-rpc-testnet.stellar.org`                 |
-| `DEPLOYER_SECRET_KEY`    | Private key to deploy smart contracts (needs funding) | (Required for deployer tool)                              |
+| `STELLAR_NETWORK_PASSPHRASE` | Passphrase matching the network (optional — falls back to the well-known passphrase) | `"Test SDF Network ; September 2015"` |
+| `JWT_SECRET`             | JWT signing secret (required; ≥32 chars in production) | Generate with `openssl rand -hex 32`                      |
+| `ENCRYPTION_SECRET`      | Master secret for per-user key derivation (required in production) | Generate with `openssl rand -base64 48`        |
+| `DEPLOYER_SECRET_KEY`    | Funded key required to boot — `ContractsService` reads it with `getOrThrow` at startup | (Required for Contracts module)   |
+| `RESEND_FROM_EMAIL`      | `From` address for all transactional email            | `SaviTools <noreply@savitools.dev>`                       |
 | `WEB_ORIGIN`             | Allowed origin for API and WebSocket CORS             | `http://localhost:3000`                                   |
 | `THROTTLE_TTL`           | Rate limiting sliding window size in milliseconds     | `60000` (1 minute)                                        |
 | `THROTTLE_LIMIT`         | Max requests allowed in the rate limit window         | `100`                                                     |
 | `NEXT_PUBLIC_API_URL`    | Frontend → API URL                                    | `http://localhost:3001/api`                               |
+
+The full list of runtime-read variables lives in `apps/api/.env.example`. On
+startup, `apps/api/src/config/env-validation.ts` validates the configuration
+and fails fast with an aggregated error listing every problem: missing
+required URLs, non-HTTPS public URLs in production, placeholder auth or
+encryption secrets, and feature variables (e.g. `RESEND_API_KEY` without
+`RESEND_FROM_EMAIL`) that an enabled feature needs.
 
 ### Security & Rate Limiting
 

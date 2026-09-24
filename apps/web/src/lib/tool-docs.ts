@@ -155,7 +155,7 @@ export const toolDocs: ToolDocs[] = [
     tagline: 'Build multi-operation Stellar transactions visually — no SDK required.',
     overview: [
       'The Composer is a visual builder for Stellar transactions. Add operations (payments, trustlines, offers, path payments, and more), configure the source account and fee, and generate the unsigned XDR.',
-      'The result can be signed in the browser with a secret key, simulated to check for errors, and submitted to the network.',
+      'The result can be signed with a browser wallet (e.g. Freighter) or locally with a secret key, simulated to check for errors, and submitted through the active network profile.',
     ],
     prerequisites: [
       'A funded Stellar account (public key + sequence number).',
@@ -180,8 +180,10 @@ export const toolDocs: ToolDocs[] = [
       {
         title: 'Sign and submit',
         steps: [
-          'Paste the unsigned XDR into the sign step and provide the source secret key.',
-          'The transaction is signed locally in the browser; the secret is zeroed from memory after use.',
+          'Open the sign step and choose how to sign: a browser wallet (Freighter) or the source secret key.',
+          'Wallet mode connects to the extension, shows the connected public key, and signs the XDR with the active network passphrase — no secret key is ever requested. Account or network mismatches are rejected before signing.',
+          'Secret-key mode signs locally in the browser; the secret is zeroed from memory after use.',
+          'Submission always goes through the active network profile — built-in or custom Horizon URL.',
           'Simulate first to catch errors before submitting, then submit and view the result hash.',
         ],
       },

@@ -43,7 +43,12 @@ export async function apiFetch<T>(
   return parseJson<T>(response);
 }
 
-export async function downloadCsv(path: string, filename: string) {
+export async function downloadCsv(path: string, filename: string): Promise<void> {
+  /**
+ * Shared download helper: fetches an authenticated endpoint that responds
+ * with a file attachment and triggers a browser download. Used by the monitor
+ * CSV export and the inspector transaction export (see Savitura/Savitools#195).
+ */
   const response = await fetch(`${API_URL}/v1${path}`, {
     credentials: "include",
   });
@@ -58,10 +63,12 @@ export async function downloadCsv(path: string, filename: string) {
 
   const blob = await response.blob();
   const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  a.click();
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
   URL.revokeObjectURL(url);
 }
 
@@ -83,6 +90,20 @@ export async function login(email: string, password: string) {
   return apiFetch<{ user: AuthUser }>("/auth/login", {
     method: "POST",
     body: JSON.stringify({ email, password }),
+  });
+}
+
+export async function requestPasswordReset(email: string) {
+  return apiFetch<{ message: string }>("/auth/forgot-password", {
+    method: "POST",
+    body: JSON.stringify({ email }),
+  });
+}
+
+export async function resetPassword(token: string, password: string) {
+  return apiFetch<{ message: string }>("/auth/reset-password", {
+    method: "POST",
+    body: JSON.stringify({ token, password }),
   });
 }
 
@@ -948,6 +969,38 @@ export interface ComposerPayload {
   operations: Array<Record<string, unknown> & { type: string }>;
 }
 
+export interface DecodedEventTopic {
+  index: number;
+  friendlyName: string | null;
+  value: DecodedScVal | null;
+  rawHex: string;
+}
+
+export interface DecodedSorobanEvent {
+  index: number;
+  contractId: string | null;
+  type: string;
+  eventName: string | null;
+  signature: string;
+  topics: DecodedEventTopic[];
+  data: DecodedScVal | null;
+  inSuccessfulContractCall: boolean;
+  partial: boolean;
+}
+
+export interface GroupedSorobanEvents {
+  contractId: string | null;
+  events: DecodedSorobanEvent[];
+}
+
+export interface TransactionEventsResponse {
+  hash: string;
+  network: string;
+  count: number;
+  events: DecodedSorobanEvent[];
+  grouped: GroupedSorobanEvents[];
+}
+
 export interface TransactionBreakdown {
   hash: string;
   ledger: number;
@@ -965,6 +1018,7 @@ export interface TransactionBreakdown {
   resultExplanation: string;
   operationCount: number;
   operations: DecodedOperationResult[];
+  sorobanEvents?: DecodedSorobanEvent[];
   rawJson: Record<string, unknown> | null;
   network: string;
   composerPayload: ComposerPayload | null;
@@ -985,6 +1039,19 @@ export async function inspectTransaction(
 ) {
   return apiFetch<TransactionBreakdown>(
     `/inspector/tx/${encodeURIComponent(hash)}?network=${network}`,
+  );
+}
+
+export async function getTransactionEvents(
+  hash: string,
+  network: "testnet" | "mainnet" = "testnet",
+  filter?: { contractId?: string; eventName?: string },
+) {
+  const params = new URLSearchParams({ network });
+  if (filter?.contractId) params.set("contractId", filter.contractId);
+  if (filter?.eventName) params.set("eventName", filter.eventName);
+  return apiFetch<TransactionEventsResponse>(
+    `/inspector/tx/${encodeURIComponent(hash)}/events?${params.toString()}`,
   );
 }
 

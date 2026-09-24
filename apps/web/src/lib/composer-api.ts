@@ -124,22 +124,34 @@ export async function simulateTransaction(
   });
 }
 
-export async function submitToHorizon(xdr: string, network: 'testnet' | 'mainnet' = 'testnet'): Promise<{ success: boolean; hash?: string; error?: string }> {
-  const horizonUrl =
-    network === 'mainnet'
+export async function submitToHorizon(xdr: string, network: 'testnet' | 'mainnet' = 'testnet', horizonUrl?: string): Promise<{ success: boolean; hash?: string; error?: string }> {
+  const url =
+    horizonUrl ??
+    (network === 'mainnet'
       ? 'https://horizon.stellar.org'
-      : 'https://horizon-testnet.stellar.org';
+      : 'https://horizon-testnet.stellar.org');
+  return submitSignedTransaction(xdr, url);
+}
+
+/**
+ * Shared submission client (Savitura/Savitools#198): every signing path
+ * (wallet or secret key) submits through this function so the transaction is
+ * always posted to the active Horizon — a built-in or custom network profile
+ * URL — instead of a hard-coded per-network constant.
+ */
+export async function submitSignedTransaction(xdr: string, horizonUrl: string): Promise<{ success: boolean; hash?: string; error?: string }> {
+  const base = horizonUrl.replace(/\/+$/, '');
 
   try {
     const params = new URLSearchParams({ tx: xdr });
-    const res = await fetch(`${horizonUrl}/transactions`, {
+    const res = await fetch(`${base}/transactions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: params.toString(),
     });
-    const data = (await res.json()) as { hash?: string; title?: string };
+    const data = (await res.json()) as { hash?: string; title?: string; detail?: string };
     if (res.ok && data.hash) return { success: true, hash: data.hash };
-    return { success: false, error: data.title ?? 'Submission failed' };
+    return { success: false, error: data.detail ?? data.title ?? 'Submission failed' };
   } catch (e) {
     return { success: false, error: String(e) };
   }
