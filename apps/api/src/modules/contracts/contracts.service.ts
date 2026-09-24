@@ -1,5 +1,14 @@
-import { Injectable, BadRequestException, UnprocessableEntityException, ForbiddenException, NotFoundException, Logger } from '@nestjs/common';
+import {
+  Injectable,
+  BadRequestException,
+  UnprocessableEntityException,
+  ForbiddenException,
+  NotFoundException,
+  Logger,
+  Optional,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { MetricsService } from '../metrics/metrics.service';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -727,25 +736,21 @@ export class ContractsService {
   }
 
   private assertInvocationAllowed(contractId: string, functionName: string): void {
-    const allowedContracts = this.configService.get<string>('CONTRACT_INVOKE_ALLOWED_CONTRACTS');
-    const allowedFunctions = this.configService.get<string>('CONTRACT_INVOKE_ALLOWED_FUNCTIONS');
+    const allowedContractsRaw = this.configService.get<string>('CONTRACT_INVOKE_ALLOWED_CONTRACTS');
+    const allowedFunctionsRaw = this.configService.get<string>('CONTRACT_INVOKE_ALLOWED_FUNCTIONS');
 
-    if (!allowedContracts || !allowedFunctions) {
+    if (!allowedContractsRaw || !allowedFunctionsRaw) {
       throw new ForbiddenException('Contract invocations are not permitted (allowlist not configured)');
     }
 
-    const allowedFunctions = this.parseAllowlist('CONTRACT_INVOKE_ALLOWED_FUNCTIONS');
-    if (!allowedFunctions.includes(functionName)) {
-      throw new ForbiddenException(`Function ${functionName} is not allowlisted for invocation`);
-    const contractsList = allowedContracts.split(',').map((c) => c.trim());
-    const functionsList = allowedFunctions.split(',').map((f) => f.trim());
+    const contractsList = allowedContractsRaw.split(',').map((c) => c.trim()).filter(Boolean);
+    const functionsList = allowedFunctionsRaw.split(',').map((f) => f.trim()).filter(Boolean);
 
     if (!contractsList.includes(contractId) || !functionsList.includes(functionName)) {
       throw new ForbiddenException('Contract or function is not allowlisted for invocation');
     }
   }
 
-  async getInfo(contractId: string): Promise<{ contractId: string; network: string; wasmHash?: string }> {
   private parseAllowlist(configKey: string): string[] {
     const raw = this.configService.get<string>(configKey, "");
     return raw
@@ -774,30 +779,19 @@ export class ContractsService {
     const network = this.configService.get<string>('STELLAR_NETWORK', 'testnet');
 
     try {
-      const wasm = await this.rpcServer.getContractWasmByContractId(contractId);
-      const wasmHash = wasm ? hash(wasm).toString('hex') : undefined;
+      const wasm = await this.timeRpc("get_contract_wasm", () =>
+        this.rpcServer.getContractWasmByContractId(contractId),
+      );
+      const wasmHash = wasm ? hash(wasm).toString("hex") : "";
 
       return {
         contractId,
         network,
         wasmHash,
       };
-    } catch (err) {
+    } catch {
       throw new NotFoundException(`Contract ${contractId} not found on network ${network}`);
     }
-      const wasm = await this.timeRpc("get_contract_wasm", () =>
-        this.rpcServer.getContractWasmByContractId(contractId),
-      );
-      wasmHashHex = hash(wasm).toString("hex");
-    } catch {
-      throw new NotFoundException("Contract not found on the network");
-    }
-
-    return {
-      contractId,
-      wasmHash: wasmHashHex,
-      network: this.configService.get<string>("STELLAR_NETWORK", "testnet"),
-    };
   }
 
   // ─── Contract ABI catalog (Savitura/Savitools#219) ───────────────────────

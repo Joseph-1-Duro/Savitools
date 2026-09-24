@@ -133,7 +133,7 @@ describe('environment configuration validation (Savitura/Savitools#197)', () => 
   });
 
   it('requires feature-specific variables when their features are enabled', () => {
-    const withResend = {
+    const withResend: Record<string, string | undefined> = {
       ...validBaseConfig(),
       RESEND_API_KEY: 're_1234567890',
     };

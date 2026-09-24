@@ -95,6 +95,54 @@ export class MonitorService implements OnApplicationBootstrap {
     });
   }
 
+  async listWatches(
+    userId: string,
+    query?: PaginationQueryDto,
+  ): Promise<{ items: Watch[]; page: number; limit: number; total: number }> {
+    const page = query?.page ?? 1;
+    const limit = query?.limit ?? 50;
+    const [items, total] = await this.watchRepository.findAndCount({
+      where: { userId },
+      order: { createdAt: 'ASC' },
+      skip: (page - 1) * limit,
+      take: limit,
+    });
+    return { items, page, limit, total };
+  }
+
+  async getWatch(userId: string, watchId: string): Promise<Watch> {
+    return this.requireWatch(userId, watchId);
+  }
+
+  async getWatchEvents(
+    userId: string,
+    watchId: string,
+    query: PaginationQueryDto,
+  ): ReturnType<MonitorService['getEvents']> {
+    return this.getEvents(userId, watchId, query);
+  }
+
+  async getAlertEvents(
+    userId: string,
+    watchId: string,
+    query: PaginationQueryDto,
+  ): ReturnType<MonitorService['getAlerts']> {
+    return this.getAlerts(userId, watchId, query);
+  }
+
+  async getWebhook(
+    userId: string,
+  ): Promise<Pick<MonitorWebhook, 'id' | 'url' | 'enabled' | 'createdAt'> | null> {
+    const webhook = await this.webhookRepository.findOne({ where: { userId } });
+    if (!webhook) return null;
+    return {
+      id: webhook.id,
+      url: webhook.url,
+      enabled: webhook.enabled,
+      createdAt: webhook.createdAt,
+    };
+  }
+
   async deleteWatch(userId: string, watchId: string): Promise<void> {
     const watch = await this.requireWatch(userId, watchId);
     await this.watchRepository.delete(watch.id);

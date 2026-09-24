@@ -1,9 +1,11 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
 import { HttpStatus } from '@nestjs/common';
-import { validate, plainToInstance } from 'class-validator';
+import { validate } from 'class-validator';
+import { plainToInstance } from 'class-transformer';
 import { MonitorController } from './monitor.controller';
 import { MonitorService } from './monitor.service';
+import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { SearchEventsQueryDto } from './dto/search-events.dto';
 import { ExportEventsQueryDto } from './dto/export-events.dto';
 import type { FastifyReply } from 'fastify';
@@ -40,7 +42,10 @@ describe('MonitorController SSE and Metrics', () => {
         { provide: MonitorService, useValue: mockMonitorService },
         { provide: ConfigService, useValue: mockConfigService },
       ],
-    }).compile();
+    })
+      .overrideGuard(JwtAuthGuard)
+      .useValue({ canActivate: () => true })
+      .compile();
 
     controller = module.get<MonitorController>(MonitorController);
     configService = module.get<ConfigService>(ConfigService);
@@ -158,7 +163,10 @@ describe('MonitorController search & CSV export (Savitura/Savitools#195)', () =>
         { provide: MonitorService, useValue: mockMonitorService },
         { provide: ConfigService, useValue: mockConfigService },
       ],
-    }).compile();
+    })
+      .overrideGuard(JwtAuthGuard)
+      .useValue({ canActivate: () => true })
+      .compile();
 
     controller = module.get<MonitorController>(MonitorController);
   });

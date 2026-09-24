@@ -17,11 +17,22 @@ export interface PriceInput {
 
 export type OperationInput = Record<string, unknown> & { type: string };
 
+export type PreconditionsInput =
+  | { type: 'time_bounds'; minTime: number; maxTime: number }
+  | { type: 'ledger_bounds'; minLedger: number; maxLedger: number }
+  | {
+      type: 'min_sequence';
+      minSequence: string;
+      minLedgerAge?: number;
+      maxLedgerAhead?: number;
+    };
+
 export interface BuildTransactionInput {
   sourceAccount: string;
   network?: 'testnet' | 'mainnet';
   memo?: string;
   operations: OperationInput[];
+  preconditions?: PreconditionsInput[];
 }
 
 export interface BuildTransactionResult {
@@ -110,6 +121,40 @@ export async function buildTransaction(
   input: BuildTransactionInput,
 ): Promise<BuildTransactionResult> {
   return apiFetch<BuildTransactionResult>('/composer/build', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+}
+
+// -------------------------------------------------------------------------------
+// Fee-bump (Savitura/Savitools#207)
+// -------------------------------------------------------------------------------
+
+export interface FeeBumpInput {
+  /** Base64 XDR of an unsigned classic inner transaction envelope. */
+  innerXdr: string;
+  /** Fee-source account public key (G…). */
+  feeSource: string;
+  /** Outer fee per operation in stroops. */
+  baseFee: string;
+  network?: 'testnet' | 'mainnet';
+}
+
+export interface FeeBumpResult {
+  xdr: string;
+  hash: string;
+  innerHash: string;
+  type: 'fee_bump';
+  feeSource: string;
+  baseFee: string;
+  fee: string;
+  operationCount: number;
+  network: string;
+}
+
+/** Build an unsigned fee-bump envelope. Never signs server-side. */
+export async function buildFeeBump(input: FeeBumpInput): Promise<FeeBumpResult> {
+  return apiFetch<FeeBumpResult>('/composer/fee-bump', {
     method: 'POST',
     body: JSON.stringify(input),
   });

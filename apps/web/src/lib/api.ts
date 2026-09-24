@@ -1,3 +1,10 @@
+import type {
+  AuthenticationResponseJSON,
+  PublicKeyCredentialCreationOptionsJSON,
+  PublicKeyCredentialRequestOptionsJSON,
+  RegistrationResponseJSON,
+} from '@simplewebauthn/browser';
+
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001/api";
 
 export interface AuthUser {
@@ -807,6 +814,105 @@ export async function getOrderbookHistory(
   return apiFetch<MidPriceSnapshot[]>(
     `/simulator/orderbook/history?${params.toString()}`,
   );
+}
+
+/* ─── Trade tape (Savitura/Savitools#212) ──────────────────────────────── */
+
+export interface TradeRow {
+  id: string;
+  pagingToken: string;
+  operationId: string | null;
+  ledger: number | null;
+  closeTime: string | null;
+  tradeType: string;
+  baseAsset: string;
+  quoteAsset: string;
+  price: string;
+  baseAmount: string;
+  quoteAmount: string;
+  buyer: string;
+  seller: string;
+  side: "buy" | "sell";
+}
+
+export interface TradeTapeResult {
+  selling: string;
+  buying: string;
+  network: NetworkChoice;
+  order: "asc" | "desc";
+  limit: number;
+  cursor: string | null;
+  trades: TradeRow[];
+  nextCursor: string | null;
+  hasMore: boolean;
+  truncated: boolean;
+  lastUpdated: number;
+}
+
+export interface GetTradesParams {
+  selling: string;
+  buying: string;
+  network?: NetworkChoice;
+  limit?: number;
+  cursor?: string;
+  order?: "asc" | "desc";
+  side?: "buy" | "sell";
+  account?: string;
+  startTime?: number;
+  endTime?: number;
+}
+
+export async function getTrades(params: GetTradesParams) {
+  const query = new URLSearchParams();
+  query.set("selling", params.selling);
+  query.set("buying", params.buying);
+  if (params.network) query.set("network", params.network);
+  if (params.limit) query.set("limit", String(params.limit));
+  if (params.cursor) query.set("cursor", params.cursor);
+  if (params.order) query.set("order", params.order);
+  if (params.side) query.set("side", params.side);
+  if (params.account) query.set("account", params.account);
+  if (params.startTime !== undefined) query.set("startTime", String(params.startTime));
+  if (params.endTime !== undefined) query.set("endTime", String(params.endTime));
+  return apiFetch<TradeTapeResult>(`/simulator/trades?${query.toString()}`);
+}
+
+/* ─── Order fill quote (Savitura/Savitools#213) ────────────────────────── */
+
+export type QuoteStatus = "filled" | "partial" | "unfilled";
+
+export interface OrderQuoteResult {
+  selling: string;
+  buying: string;
+  network: NetworkChoice;
+  side: "buy" | "sell";
+  requestedAmount: string;
+  filledAmount: string;
+  unfilledAmount: string;
+  status: QuoteStatus;
+  averagePrice: string | null;
+  worstPrice: string | null;
+  bestPrice: string | null;
+  cost: string;
+  priceImpactBps: number | null;
+  estimatedFee: string;
+  levelsConsumed: number;
+  lastUpdated: number;
+}
+
+export interface OrderQuoteParams {
+  selling: string;
+  buying: string;
+  side: "buy" | "sell";
+  amount: string;
+  network?: NetworkChoice;
+}
+
+export async function getOrderQuote(params: OrderQuoteParams) {
+  return apiFetch<OrderQuoteResult>("/simulator/orderbook/quote", {
+    method: "POST",
+    body: JSON.stringify(params),
+  });
 }
 
 /* ─── Webhooks ──────────────────────────────────────────────────────────── */

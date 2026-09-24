@@ -1,4 +1,4 @@
-import { Address, nativeToScVal, StrKey, xdr } from '@stellar/stellar-sdk';
+import { nativeToScVal, StrKey, xdr } from '@stellar/stellar-sdk';
 import {
   decodeContractEvent,
   filterSorobanEvents,
@@ -10,23 +10,49 @@ import {
 const CONTRACT_ID = 'CA3D5KRYM6CB7OWQ6TWYRR3Z4T7GNZLKERYNZGGA5SOAOPIFY6YQGAXE';
 
 /** Well-known genesis / friendbot-style accounts (valid StrKey). */
-const ACCOUNT_A = 'GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3M4PJGDLP47CEV5JVTVDASK';
-const ACCOUNT_B = 'GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGSNFHEYVXM3XOJMDLXZ67A';
+const ACCOUNT_A = 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7';
+const ACCOUNT_B = 'GALPCCZN4YXA3YMJHKL6CVIECKPLJJCTVMSNYWBTKJW4K5HQLYLDMZTB';
+
+function accountScVal(accountId: string): xdr.ScVal {
+  return nativeToScVal(accountId, { type: 'address' });
+}
+
+function contractEventBody(v0: xdr.ContractEventV0): xdr.ContractEventBody {
+  return new (xdr.ContractEventBody as unknown as {
+    new (switchValue: number, value: xdr.ContractEventV0): xdr.ContractEventBody;
+  })(0, v0);
+}
+
+function extensionPoint(): xdr.ExtensionPoint {
+  return new (xdr.ExtensionPoint as unknown as {
+    new (switchValue: number): xdr.ExtensionPoint;
+  })(0);
+}
+
+function sorobanMetaExt(): xdr.SorobanTransactionMetaExt {
+  return new (xdr.SorobanTransactionMetaExt as unknown as {
+    new (switchValue: number): xdr.SorobanTransactionMetaExt;
+  })(0);
+}
+
+function transactionMetaV3(value: xdr.TransactionMetaV3): xdr.TransactionMeta {
+  return new (xdr.TransactionMeta as unknown as {
+    new (switchValue: number, value: xdr.TransactionMetaV3): xdr.TransactionMeta;
+  })(3, value);
+}
 
 function makeTransferEvent(): xdr.ContractEvent {
   const topics = [
     nativeToScVal('transfer', { type: 'symbol' }),
-    new Address(ACCOUNT_A).toScVal(),
-    new Address(ACCOUNT_B).toScVal(),
+    accountScVal(ACCOUNT_A),
+    accountScVal(ACCOUNT_B),
   ];
   const data = nativeToScVal(1_000_000n, { type: 'i128' });
-  const body = xdr.ContractEventBody.v0(
-    new xdr.ContractEventV0({ topics, data }),
-  );
+  const body = contractEventBody(new xdr.ContractEventV0({ topics, data }));
   return new xdr.ContractEvent({
-    ext: xdr.ExtensionPoint.void(),
+    ext: extensionPoint(),
     contractId: StrKey.decodeContract(CONTRACT_ID),
-    type: xdr.ContractEventType.contractEventTypeContract(),
+    type: xdr.ContractEventType.contract(),
     body,
   });
 }
@@ -34,13 +60,11 @@ function makeTransferEvent(): xdr.ContractEvent {
 function makeUnknownTopicEvent(): xdr.ContractEvent {
   const topics = [nativeToScVal(Buffer.from('deadbeef', 'hex'), { type: 'bytes' })];
   const data = nativeToScVal(true);
-  const body = xdr.ContractEventBody.v0(
-    new xdr.ContractEventV0({ topics, data }),
-  );
+  const body = contractEventBody(new xdr.ContractEventV0({ topics, data }));
   return new xdr.ContractEvent({
-    ext: xdr.ExtensionPoint.void(),
+    ext: extensionPoint(),
     contractId: StrKey.decodeContract(CONTRACT_ID),
-    type: xdr.ContractEventType.contractEventTypeContract(),
+    type: xdr.ContractEventType.contract(),
     body,
   });
 }
@@ -51,35 +75,35 @@ function makeNestedContainerEvent(): xdr.ContractEvent {
     nativeToScVal('nested', { type: 'string' }),
     nativeToScVal({ k: 'v' }),
   ]);
-  const body = xdr.ContractEventBody.v0(
+  const body = contractEventBody(
     new xdr.ContractEventV0({
       topics: [nativeToScVal('swap', { type: 'symbol' })],
       data: vec,
     }),
   );
   return new xdr.ContractEvent({
-    ext: xdr.ExtensionPoint.void(),
+    ext: extensionPoint(),
     contractId: StrKey.decodeContract(CONTRACT_ID),
-    type: xdr.ContractEventType.contractEventTypeContract(),
+    type: xdr.ContractEventType.contract(),
     body,
   });
 }
 
 function wrapInMeta(events: xdr.ContractEvent[]): string {
   const soroban = new xdr.SorobanTransactionMeta({
-    ext: xdr.SorobanTransactionMetaExt.void(),
+    ext: sorobanMetaExt(),
     returnValue: xdr.ScVal.scvVoid(),
     events,
     diagnosticEvents: [],
   });
   const metaV3 = new xdr.TransactionMetaV3({
-    ext: xdr.ExtensionPoint.void(),
+    ext: extensionPoint(),
     txChangesBefore: [],
     operations: [],
     txChangesAfter: [],
     sorobanMeta: soroban,
   });
-  return xdr.TransactionMeta.v3(metaV3).toXDR('base64');
+  return transactionMetaV3(metaV3).toXDR('base64');
 }
 
 describe('event-parser', () => {

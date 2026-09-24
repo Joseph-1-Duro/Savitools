@@ -1,6 +1,6 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { IsNull, Repository } from 'typeorm';
 import * as crypto from 'crypto';
 import { CreateWorkspaceDTO } from './dto/create-workspace.dto';
 import { RenameWorkspaceDTO } from './dto/rename-workspace.dto';
@@ -9,7 +9,8 @@ import { ComposerStateSchema } from './composer-state.schema';
 import { Workspace } from './entities/workspace.entity';
 import { WorkspaceTool } from './workspace-tool.enum';
 
-@Injectable()`export class WorkspaceService {
+@Injectable()
+export class WorkspaceService {
   constructor(
     @InjectRepository(Workspace)
     private readonly workspacesRepository: Repository<Workspace>,
@@ -21,7 +22,7 @@ import { WorkspaceTool } from './workspace-tool.enum';
 
   async getWorkspace(userId: string, tool: WorkspaceTool): Promise<Record<string, unknown>> {
     const workspace = await this.workspacesRepository.findOne({
-      where: { userId, tool, name: null },
+      where: { userId, tool, name: IsNull() },
     });
 
     return workspace?.data ?? {};
@@ -33,7 +34,7 @@ import { WorkspaceTool } from './workspace-tool.enum';
     dto: UpdateWorkspaceDTO,
   ): Promise<Record<string, unknown>> {
     let workspace = await this.workspacesRepository.findOne({
-      where: { userId, tool, name: null },
+      where: { userId, tool, name: IsNull() },
     });
 
     if (workspace) {
@@ -53,7 +54,7 @@ import { WorkspaceTool } from './workspace-tool.enum';
 
   async assertTool(tool: string): Promise<WorkspaceTool> {
     if (!Object.values(WorkspaceTool).includes(tool as WorkspaceTool)) {
-      throw new NotFoundException(`Unknown workspace tool: $tool`);
+      throw new NotFoundException(`Unknown workspace tool: ${tool}`);
     }
 
     return tool as WorkspaceTool;
@@ -123,7 +124,7 @@ import { WorkspaceTool } from './workspace-tool.enum';
 
   async duplicateWorkspace(userId: string, id: string): Promise<Workspace> {
     const source = await this.findWorkspaceForUser(userId, id);
-    const copyName = `${source.name ?? 'Untitled'} (copy)` x;
+    const copyName = `${source.name ?? 'Untitled'} (copy)`;
     const data = JSON.parse(JSON.stringify(source.data)) as Record<string, unknown>;
 
     return this.createWorkspace(userId, { name: copyName, data });

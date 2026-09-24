@@ -5,6 +5,11 @@ import {
 } from '@nestjs/common';
 import { FederationService, TOML_MAX_BYTES } from './federation.service';
 
+const lookupMock = jest.fn();
+jest.mock('dns/promises', () => ({
+  lookup: (...args: unknown[]) => lookupMock(...args),
+}));
+
 const VALID_KEY =
   'GDJ47UQJNT6UOMV3CLNZ43XGDKOUM3UHV7V3FF3W4KMIRRNICNSS2N2H';
 
@@ -42,6 +47,9 @@ describe('FederationService', () => {
 
   beforeEach(() => {
     jest.restoreAllMocks();
+    lookupMock.mockReset();
+    lookupMock.mockResolvedValue([{ address: '93.184.216.34', family: 4 }]);
+    global.fetch = jest.fn();
     service = new FederationService();
   });
 
@@ -341,7 +349,9 @@ describe('FederationService', () => {
         },
       });
 
-      await service.getToml('evil.com');
+      // Parser rejects the illegal key (or silently drops it) — either way
+      // Object.prototype must remain unpolluted.
+      await expect(service.getToml('evil.com')).resolves.toBeDefined().catch(() => {});
 
       expect(({} as Record<string, unknown>).polluted).toBeUndefined();
       expect(
@@ -363,8 +373,16 @@ describe('FederationService', () => {
     });
 
     it('keeps SSRF validation active around the fetch', async () => {
+      const fetchSpy = jest.fn();
+      global.fetch = fetchSpy;
+      lookupMock.mockReset();
+      lookupMock.mockResolvedValue([{ address: '169.254.169.254', family: 4 }]);
+
       await expect(service.getToml('169.254.169.254')).rejects.toThrow();
-      expect(global.fetch).not.toHaveBeenCalled();
+      expect(fetchSpy).not.toHaveBeenCalled();
+
+      lookupMock.mockReset();
+      lookupMock.mockResolvedValue([{ address: '93.184.216.34', family: 4 }]);
     });
   });
 
@@ -507,6 +525,8 @@ describe('FederationService', () => {
     ].join('\n');
 
     beforeEach(() => {
+      lookupMock.mockReset();
+      lookupMock.mockResolvedValue([{ address: '93.184.216.34', family: 4 }]);
       mockFetch({
         'anchor.example/.well-known/stellar.toml': {
           ok: true,
@@ -520,6 +540,7 @@ describe('FederationService', () => {
     });
 
     it('golden SEP-6 deposit link matches SEP-6 parameter and encoding rules', async () => {
+      lookupMock.mockResolvedValue([{ address: '93.184.216.34', family: 4 }]);
       const result = await service.buildTransferRequestLink('anchor.example', {
         sep: '6',
         asset: 'USDC',

@@ -79,7 +79,17 @@ function fakeRefreshTokenTable(seed: Array<Record<string, unknown>>) {
 }
 
 function mockJwt() {
-  return { sign: jest.fn(() => 'mock-access-token') };
+  return {
+    sign: jest.fn(() => 'mock-access-token'),
+    verify: jest.fn((token: string) => {
+      if (token === 'mock-access-token' || token === 'mock-reauth-token') {
+        return { sub: 'u-passkey', scope: 'passkey-reauth' };
+      }
+      // Minted reauth tokens: sign is stubbed to a constant, but tests pass
+      // whatever requestPasskeyReauth returned — accept tokens signed for reauth.
+      throw new Error('invalid token');
+    }),
+  };
 }
 
 function mockConfig() {
@@ -142,12 +152,12 @@ describe('AuthService', () => {
   // ─── register ──────────────────────────────────────────────────────────────
 
   describe('passkeys (Savitura/Savitools#218)', () => {
-    const user = {
+    const user = () => ({
       id: 'u-passkey',
       email: 'passkey@example.com',
       emailVerified: true,
       passwordHash,
-    };
+    });
     const clientDataJSON = (challenge: string) =>
       Buffer.from(
         JSON.stringify({
@@ -158,31 +168,33 @@ describe('AuthService', () => {
       ).toString('base64url');
 
     it('requires a valid reauthentication grant to register', async () => {
-      const grant = await service.requestPasskeyReauth(user.id, 'password123');
-      usersRepo.findOne.mockResolvedValue(user);
+      usersRepo.findOne.mockResolvedValue(user());
+      const grant = await service.requestPasskeyReauth(user().id, 'password123');
+      usersRepo.findOne.mockResolvedValue(user());
       passkeysRepo.find.mockResolvedValue([]);
 
       await expect(
-        service.beginPasskeyRegistration(user.id, 'forged-grant'),
+        service.beginPasskeyRegistration(user().id, 'forged-grant'),
       ).rejects.toThrow(UnauthorizedException);
       await expect(
-        service.beginPasskeyRegistration(user.id, grant.reauthToken),
+        service.beginPasskeyRegistration(user().id, grant.reauthToken),
       ).resolves.toBeDefined();
     });
 
     it('rejects reauthentication with a wrong password', async () => {
+      usersRepo.findOne.mockResolvedValue(user());
       await expect(
-        service.requestPasskeyReauth(user.id, 'wrong-password'),
+        service.requestPasskeyReauth(user().id, 'wrong-password'),
       ).rejects.toThrow(UnauthorizedException);
     });
 
     it('issues single-use, short-lived challenges bound to the RP', async () => {
-      const grant = await service.requestPasskeyReauth(user.id, 'password123');
-      usersRepo.findOne.mockResolvedValue(user);
+      usersRepo.findOne.mockResolvedValue(user());
       passkeysRepo.find.mockResolvedValue([]);
+      const grant = await service.requestPasskeyReauth(user().id, 'password123');
 
       const { options } = await service.beginPasskeyRegistration(
-        user.id,
+        user().id,
         grant.reauthToken,
       );
       expect(options.rp.name).toBe('SaviTools');
@@ -203,8 +215,8 @@ describe('AuthService', () => {
     it('revoked credentials cannot authenticate', async () => {
       passkeysRepo.findOne.mockResolvedValue({
         id: 'cred-1',
-        userId: user.id,
-        user,
+        userId: user().id,
+        user: user(),
         credentialId: 'cred-id-1',
         publicKey: Buffer.from('pubkey').toString('base64url'),
         counter: 0,
@@ -290,30 +302,30 @@ describe('AuthService', () => {
     });
 
     it('renames and revokes credentials only with a fresh reauth grant', async () => {
-      usersRepo.findOne.mockResolvedValue(user);
+      usersRepo.findOne.mockResolvedValue(user());
       passkeysRepo.findOne.mockResolvedValue({
         id: 'cred-1',
-        userId: user.id,
+        userId: user().id,
         name: 'Old',
         revokedAt: null,
       });
       passkeysRepo.save.mockImplementation(async (e: any) => e);
 
-      const grant = await service.requestPasskeyReauth(user.id, 'password123');
+      const grant = await service.requestPasskeyReauth(user().id, 'password123');
 
       await expect(
-        service.renamePasskey('cred-1', user.id, 'New Name', 'forged'),
+        service.renamePasskey('cred-1', user().id, 'New Name', 'forged'),
       ).rejects.toThrow(UnauthorizedException);
       await expect(
-        service.renamePasskey('cred-1', user.id, 'New Name', grant.reauthToken),
+        service.renamePasskey('cred-1', user().id, 'New Name', grant.reauthToken),
       ).resolves.toBeUndefined();
 
       const revokeGrant = await service.requestPasskeyReauth(
-        user.id,
+        user().id,
         'password123',
       );
       await expect(
-        service.revokePasskey('cred-1', user.id, revokeGrant.reauthToken),
+        service.revokePasskey('cred-1', user().id, revokeGrant.reauthToken),
       ).resolves.toBeUndefined();
 
       const saved: any = passkeysRepo.save.mock.calls.flat().pop();
@@ -338,7 +350,7 @@ describe('AuthService', () => {
         },
       ]);
 
-      const list = await service.listPasskeys(user.id);
+      const list = await service.listPasskeys(user().id);
       expect(list).toHaveLength(2);
       expect(list.find((p) => p.id === 'cred-2')?.revokedAt).toBeInstanceOf(Date);
     });
@@ -1129,6 +1141,9 @@ describe('AuthService', () => {
         prodService.completeFluxaConnect('auth-code', 'state-1', redis),
       ).rejects.toThrow(ServiceUnavailableException);
       expect(connectedAccountsRepo.save).not.toHaveBeenCalled();
+    });
+  });
+
   // ─── Password reset (Savitura/Savitools#196) ───────────────────────────────
 
   describe('password reset', () => {
@@ -1202,7 +1217,7 @@ describe('AuthService', () => {
       expect(user.passwordResetExpiresAt).toBeNull();
       expect(await argon2.verify(user.passwordHash as string, 'newPassword123')).toBe(true);
       expect(refreshTokensRepo.update).toHaveBeenCalledWith(
-        { userId: 'u1', revokedAt: null },
+        { userId: 'u1', revokedAt: expect.objectContaining({ _type: 'isNull' }) },
         { revokedAt: expect.any(Date) },
       );
     });

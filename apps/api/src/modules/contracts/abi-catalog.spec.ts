@@ -67,7 +67,19 @@ describe('buildAbiCatalog (#219)', () => {
         methods: [{ name: 'set', args: [{ name: 'flag', type: 'BigInt128' }] }],
         events: [],
       }),
-    ).toThrow(/unsupported type/);
+    ).toThrow(UnprocessableEntityException);
+    try {
+      buildAbiCatalog(CONTRACT_ID, {
+        methods: [{ name: 'set', args: [{ name: 'flag', type: 'BigInt128' }] }],
+        events: [],
+      });
+      fail('expected UnprocessableEntityException');
+    } catch (err) {
+      const response = (err as UnprocessableEntityException).getResponse() as {
+        errors?: Array<{ message: string }>;
+      };
+      expect(JSON.stringify(response)).toMatch(/unsupported type/i);
+    }
   });
 
   it('rejects invalid schemas, duplicate names, and oversized documents', () => {
@@ -84,22 +96,19 @@ describe('buildAbiCatalog (#219)', () => {
   });
 
   it('rejects __proto__ keys so a pollution payload cannot reach the catalog', () => {
-    expect(() =>
-      buildAbiCatalog(CONTRACT_ID, {
-        methods: [],
-        events: [],
-        __proto__: { polluted: true },
-      } as unknown as Record<string, unknown>),
-    ).toThrow(BadRequestException);
+    const payload = JSON.parse(
+      '{"methods":[],"events":[],"__proto__":{"polluted":true}}',
+    ) as unknown as Record<string, unknown>;
+    expect(() => buildAbiCatalog(CONTRACT_ID, payload)).toThrow(BadRequestException);
     expect(({} as Record<string, unknown>).polluted).toBeUndefined();
   });
 });
 
 describe('encodeAbiArgument (#219)', () => {
   it('preserves decimal precision beyond binary floating point for i128', () => {
-    const exact = '340282366920938463463374607431768211455';
+    const exact = '170141183460469231731687303715884105727';
     const { decoded } = encodeAbiArgument('i128', exact);
-    expect(decoded.type).toBe('I128');
+    expect(decoded.type).toMatch(/i128/i);
     expect(decoded.value).toBe(exact);
   });
 

@@ -243,7 +243,9 @@ describe('ContractsService', () => {
           if (args[0] === 'checkout' && sparseArtifact && opts?.cwd) {
             const target = nodePath.join(opts.cwd, sparseArtifact);
             if (sparseArtifact === 'link.wasm') {
-              fs.symlinkSync('/etc/hostname', target);
+              // Point at a path that exists on every OS so existsSync is true
+              // and the non-regular-file check is what rejects the symlink.
+              fs.symlinkSync(process.execPath, target);
             } else {
               fs.mkdirSync(nodePath.dirname(target), { recursive: true });
               fs.writeFileSync(target, Buffer.from('wasm-bytes'));
@@ -254,7 +256,10 @@ describe('ContractsService', () => {
       );
     };
 
-    beforeEach(() => lookupMock.mockReset());
+    beforeEach(() => {
+      lookupMock.mockReset();
+      lookupMock.mockResolvedValue([{ address: '140.82.112.3' }]);
+    });
 
     afterEach(() => {
       execFileSyncMock.mockReset();
@@ -354,6 +359,7 @@ describe('ContractsService', () => {
 
     beforeEach(() => {
       lookupMock.mockReset();
+      lookupMock.mockResolvedValue([{ address: '93.184.216.34' }]);
       fetchMock = jest.fn();
       (global as { fetch: unknown }).fetch = fetchMock;
     });
@@ -444,7 +450,8 @@ describe('ContractsService', () => {
 
     it('expires stale URL cache entries and re-downloads', async () => {
       const { service } = await createModule();
-      fetchMock.mockResolvedValue(wasmResponse());
+      fetchMock.mockImplementation(() => Promise.resolve(wasmResponse()));
+      lookupMock.mockResolvedValue([{ address: '93.184.216.34' }]);
       const url = 'http://93.184.216.34/contract.wasm';
 
       await service.fetchWasmFromUrl(url);
@@ -465,7 +472,8 @@ describe('ContractsService', () => {
 
     it('bounds the URL and content caches', async () => {
       const { service } = await createModule();
-      fetchMock.mockResolvedValue(wasmResponse());
+      fetchMock.mockImplementation(() => Promise.resolve(wasmResponse()));
+      lookupMock.mockResolvedValue([{ address: '93.184.216.34' }]);
 
       for (let i = 0; i < 105; i++) {
         await service.storeUploadedWasm({

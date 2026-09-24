@@ -6,7 +6,7 @@ import { BadRequestException, GatewayTimeoutException, PayloadTooLargeException 
 import { ContractsController } from './contracts.controller';
 import { ContractsService } from './contracts.service';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
-import { ContractAuthorizationGard } from './guards/contract-authorization.guard';
+import { ContractAuthorizationGuard } from './guards/contract-authorization.guard';
 
 const JWT_SECRET = 'test-secret';
 const ALLOWED_EMAIL = 'admin@example.com';
@@ -15,16 +15,28 @@ const OTHER_EMAIL = 'nobody@example.com';
 describe('ContractsController', () => {
   let app: NestFastifyApplication;
   let jwtService: JwtService;
-  let contractsService: jest.Mocked<Pick<ContractsService, 'deploy' | 'deployConfigured' | 'uploadWasmOnly' | 'invoke' | 'getInfo' | 'storeUploadedWasm' | 'fetchWasmFromGit'>>;
+  let contractsService: jest.Mocked<
+    Pick<
+      ContractsService,
+      | 'deploy'
+      | 'deployConfigured'
+      | 'uploadWasmOnly'
+      | 'invoke'
+      | 'getInfo'
+      | 'storeUploadedWasm'
+      | 'fetchWasmFromGit'
+      | 'fetchWasmFromUrl'
+    >
+  >;
 
   beforeAll(async () => {
     contractsService = {
-      deploy: jest.fn().mockResolved({ contractId: 'C123', wasmHash: 'abc', txHash: 'tx' }),
-      deployConfigured: jest.fn().mockResolved({ contractId: 'C123', wasmHash: 'abc', txHash: 'tx' }),
-      uploadWasmOnly: jest.fn().mockResolved({ wasmHash: 'abc', size: 10 }),
-      invoke: jest.fn().mockResolved({ result: null, txHash: 'tx' }),
+      deploy: jest.fn().mockResolvedValue({ contractId: 'C123', wasmHash: 'abc', txHash: 'tx' }),
+      deployConfigured: jest.fn().mockResolvedValue({ contractId: 'C123', wasmHash: 'abc', txHash: 'tx' }),
+      uploadWasmOnly: jest.fn().mockResolvedValue({ wasmHash: 'abc', size: 10 }),
+      invoke: jest.fn().mockResolvedValue({ result: null, txHash: 'tx' }),
       getInfo: jest.fn(),
-      storeUploadedWasm: jest.fn().mockResolved({
+      storeUploadedWasm: jest.fn().mockResolvedValue({
         wasmId: 'wasm_123',
         contentHash: 'abc',
         filename: 'contract.wasm',
@@ -33,7 +45,19 @@ describe('ContractsController', () => {
         uploadedAt: new Date().toISOString(),
         source: 'file',
       }),
-      fetchWasmFromGit: jest.fn().mockResolved(Buffer.from('wasm-bytes')),
+      fetchWasmFromGit: jest.fn().mockResolvedValue(Buffer.from('wasm-bytes')),
+      fetchWasmFromUrl: jest.fn().mockResolvedValue({
+        buffer: Buffer.from('wasm-bytes'),
+        metadata: {
+          wasmId: 'wasm_123',
+          contentHash: 'abc',
+          filename: 'contract.wasm',
+          size: 10,
+          sha256: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e464b934ca495991b7852b855',
+          uploadedAt: new Date().toISOString(),
+          source: 'url' as const,
+        },
+      }),
     };
 
     const configValues: Record<string, string> = {
@@ -59,7 +83,7 @@ describe('ContractsController', () => {
             getOrThrow: jest.fn((key: string) => {
               if (configValues[key] === undefined) throw new Error(`Missing config: ${key}`);
               return configValues[key];
-            },
+            }),
           },
         },
       ],
@@ -86,7 +110,7 @@ describe('ContractsController', () => {
       });
 
       expect(response.statusCode).toBe(401);
-      expect(contractsService.deploy).not.haveBeenCalled();
+      expect(contractsService.deploy).not.toHaveBeenCalled();
     });
 
     it('rejects authenticated but unauthorized requests with 403', async () => {
@@ -97,24 +121,25 @@ describe('ContractsController', () => {
       });
 
       expect(response.statusCode).toBe(403);
-      expect(contractsService.deploy).not.haveBeenCalled();
+      expect(contractsService.deploy).not.toHaveBeenCalled();
     });
 
     it('deploys a contract from a URL successfully', async () => {
       const wasmUrl = 'https://example.com/contract.wasm';
       const wasmBuffer = Buffer.from([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
-      const storedWasm = {
-        wasmId: 'wasm_url_1',
-        contentHash: 'hash',
-        filename: 'contract.wasm',
-        size: wasmBuffer.length,
-        sha256: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e464b934ca495991b7852b855',
-        uploadedAt: new Date().toISOString(),
-        source: 'url',
-      };
-      (contractsService.fetchWasmFromGit as jest.Mock).mockResolvedOnce(wasmBuffer);
-      (contractsService.storeUploadedWasm as jest.Mock).mockResolvedOnce(storedWasm);
-      (contractsService.deploy as jest.Mock).mockResolvedOnce({ contractId: 'C456', wasmHash: 'hash', txHash: 'tx' });
+      (contractsService.fetchWasmFromUrl as jest.Mock).mockResolvedValueOnce({
+        buffer: wasmBuffer,
+        metadata: {
+          wasmId: 'wasm_url_1',
+          contentHash: 'hash',
+          filename: 'contract.wasm',
+          size: wasmBuffer.length,
+          sha256: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e464b934ca495991b7852b855',
+          uploadedAt: new Date().toISOString(),
+          source: 'url' as const,
+        },
+      });
+      (contractsService.deploy as jest.Mock).mockResolvedValueOnce({ contractId: 'C456', wasmHash: 'hash', txHash: 'tx' });
 
       const response = await app.getHttpAdapter().getInstance().inject({
         method: 'POST',
@@ -125,13 +150,16 @@ describe('ContractsController', () => {
 
       expect(response.statusCode).toBe(201);
       expect(response.json()).toEqual({ contractId: 'C456', wasmHash: 'hash', txHash: 'tx' });
-      expect(contractsService.fetchWasmFromGit).toHaveBeenCalledWith(wasmUrl);
-      expect(contractsService.storeUploadedWasm).toHaveBeenCalledWith(wasmBuffer);
-      expect(contractsService.deploy).toHaveBeenCalledWith(expect.objectContaining({ wasmId: storedWasm.wasmId }));
+      expect(contractsService.fetchWasmFromUrl).toHaveBeenCalledWith(wasmUrl);
+      expect(contractsService.deploy).toHaveBeenCalledWith(wasmBuffer, undefined);
     });
 
     it('returns 400 when the URL is invalid', async () => {
-      (contractsService.fetchWasmFromGit as jest.Mock).mockRejectedOnce(new BadRequestException('Invalid URL'));
+      (contractsService.deploy as jest.Mock).mockClear();
+      (contractsService.fetchWasmFromUrl as jest.Mock).mockReset();
+      (contractsService.fetchWasmFromUrl as jest.Mock).mockImplementationOnce(() =>
+        Promise.reject(new BadRequestException('Invalid URL')),
+      );
 
       const response = await app.getHttpAdapter().getInstance().inject({
         method: 'POST',
@@ -141,12 +169,25 @@ describe('ContractsController', () => {
       });
 
       expect(response.statusCode).toBe(400);
-      expect(contractsService.storeUploadedWasm).not.toHaveBeenCalled();
       expect(contractsService.deploy).not.toHaveBeenCalled();
+      // Restore default mock for subsequent tests
+      (contractsService.fetchWasmFromUrl as jest.Mock).mockReset();
+      (contractsService.fetchWasmFromUrl as jest.Mock).mockResolvedValue({
+        buffer: Buffer.from('wasm-bytes'),
+        metadata: {
+          wasmId: 'wasm_123',
+          contentHash: 'abc',
+          filename: 'contract.wasm',
+          size: 10,
+          sha256: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e464b934ca495991b7852b855',
+          uploadedAt: new Date().toISOString(),
+          source: 'url' as const,
+        },
+      });
     });
 
     it('returns 413 when the downloaded WASM exceeds the size limit', async () => {
-      (contractsService.fetchWasmFromGit as jest.Mock).mockRejectedOnce(new PayloadTooLargeException('WASM exceeds 5MB limit'));
+      (contractsService.fetchWasmFromUrl as jest.Mock).mockRejectedValueOnce(new PayloadTooLargeException('WASM exceeds 5MB limit'));
 
       const response = await app.getHttpAdapter().getInstance().inject({
         method: 'POST',
@@ -159,7 +200,7 @@ describe('ContractsController', () => {
     });
 
     it('returns 504 when downloading the WASM times out', async () => {
-      (contractsService.fetchWasmFromGit as jest.Mock).mockRejectedOnce(new GatewayTimeoutException('Download timeout'));
+      (contractsService.fetchWasmFromUrl as jest.Mock).mockRejectedValueOnce(new GatewayTimeoutException('Download timeout'));
 
       const response = await app.getHttpAdapter().getInstance().inject({
         method: 'POST',
@@ -172,20 +213,21 @@ describe('ContractsController', () => {
     });
 
     it('deploys a contract from an IPFS URL', async () => {
-      const wasmUrl = 'ipfs://QmT6Ls9P4i3VvQ7fW4pJ6ymV19X3yQD7v4zFjXWm3KpWvZ:';
+      const wasmUrl = 'ipfs://QmT6Ls9P4i3VvQ7fW4pJ6ymV19X3yQD7v4zFjXWm3KpWvZ';
       const wasmBuffer = Buffer.from([0x00, 0x61, 0x73, 0x6d]);
-      const storedWasm = {
-        wasmId: 'wasm_ipfs',
-        contentHash: 'hash',
-        filename: 'contract.wasm',
-        size: wasmBuffer.length,
-        sha256: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e464b934ca495991b7852b855',
-        uploadedAt: new Date().toISOString(),
-        source: 'url',
-      };
-      (contractsService.fetchWasmFromGit as jest.Mock).mockResolvedOnce(wasmBuffer);
-      (contractsService.storeUploadedWasm as jest.Mock).mockResolvedOnce(storedWasm);
-      (contractsService.deploy as jest.Mock).mockResolvedOnce({ contractId: 'C789', wasmHash: 'hash', txHash: 'tx' });
+      (contractsService.fetchWasmFromUrl as jest.Mock).mockResolvedValueOnce({
+        buffer: wasmBuffer,
+        metadata: {
+          wasmId: 'wasm_ipfs',
+          contentHash: 'hash',
+          filename: 'contract.wasm',
+          size: wasmBuffer.length,
+          sha256: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e464b934ca495991b7852b855',
+          uploadedAt: new Date().toISOString(),
+          source: 'url' as const,
+        },
+      });
+      (contractsService.deploy as jest.Mock).mockResolvedValueOnce({ contractId: 'C789', wasmHash: 'hash', txHash: 'tx' });
 
       const response = await app.getHttpAdapter().getInstance().inject({
         method: 'POST',
@@ -195,24 +237,25 @@ describe('ContractsController', () => {
       });
 
       expect(response.statusCode).toBe(201);
-      expect(contractsService&fetchWasmFromGit).toHaveBeenCalledWith(wasmUrl);
+      expect(contractsService.fetchWasmFromUrl).toHaveBeenCalledWith(wasmUrl);
     });
 
     it('deploys a contract from an Arweave URL', async () => {
       const wasmUrl = 'ar://xyz-abcdefg-hijklmnopqrstuvwxz';
       const wasmBuffer = Buffer.from([0x00, 0x61, 0x73, 0x6d]);
-      const storedWasm = {
-        wasmId: 'wasm_ar',
-        contentHash: 'hash',
-        filename: 'contract.wasm',
-        size: wasmBuffer.length,
-        sha256: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e464b934ca495991b7852b855',
-        uploadedAt: new Date().toISOString(),
-        source: 'url',
-      };
-      (contractsService.fetchWasmFromGit as jest.Mock).mockResolvedOnce(wasmBuffer);
-      (contractsService.storeUploadedWasm as jest.Mock).mockResolvedOnce(storedWasm);
-      (contractsService.deploy as jest.Mock).mockResolvedOnce({ contractId: 'C101', wasmHash: 'hash', txHash: 'tx' });
+      (contractsService.fetchWasmFromUrl as jest.Mock).mockResolvedValueOnce({
+        buffer: wasmBuffer,
+        metadata: {
+          wasmId: 'wasm_ar',
+          contentHash: 'hash',
+          filename: 'contract.wasm',
+          size: wasmBuffer.length,
+          sha256: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e464b934ca495991b7852b855',
+          uploadedAt: new Date().toISOString(),
+          source: 'url' as const,
+        },
+      });
+      (contractsService.deploy as jest.Mock).mockResolvedValueOnce({ contractId: 'C101', wasmHash: 'hash', txHash: 'tx' });
 
       const response = await app.getHttpAdapter().getInstance().inject({
         method: 'POST',
@@ -222,7 +265,7 @@ describe('ContractsController', () => {
       });
 
       expect(response.statusCode).toBe(201);
-      expect(contractsService.fetchWasmFromGit).toHaveBeenCalledWith(wasmUrl);
+      expect(contractsService.fetchWasmFromUrl).toHaveBeenCalledWith(wasmUrl);
     });
   });
 
@@ -251,7 +294,7 @@ describe('ContractsController', () => {
         payload: { step: 1, wasmBase64 },
       });
 
-      expect(step1Res.statusCode).toBe(200);
+      expect(step1Res.statusCode).toBe(201);
       const step1Json = step1Res.json();
       expect(step1Json.stepToken).toBeDefined();
       const token = step1Json.stepToken;
@@ -264,7 +307,7 @@ describe('ContractsController', () => {
         payload: { step: 2, stepToken: token, args: '[]' },
       });
 
-      expect(step2Res.statusCode).toBe(200);
+      expect(step2Res.statusCode).toBe(201);
       const step2Json = step2Res.json();
       expect(step2Json.stepToken).toBeDefined();
       const token2 = step2Json.stepToken;
@@ -277,7 +320,7 @@ describe('ContractsController', () => {
         payload: { step: 3, stepToken: token2 },
       });
 
-      expect(step3Res.statusCode).toBe(200);
+      expect(step3Res.statusCode).toBe(201);
       const step3Json = step3Res.json();
       expect(step3Json.contractAddress).toBe('C123');
       expect(step3Json.txHash).toBe('tx');

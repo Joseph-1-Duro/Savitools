@@ -53,8 +53,8 @@ export class TransactionService {
 
     if (mods.timeBounds) {
       transaction.timeBounds = {
-        minTime: mods.timeBounds.minTime,
-        maxTime: mods.timeBounds.maxTime,
+        minTime: String(mods.timeBounds.minTime),
+        maxTime: String(mods.timeBounds.maxTime),
       };
     }
 
@@ -167,7 +167,8 @@ export class TransactionService {
     return replay;
   }
 
-  private buildOperationFromDto(op: any): StellarSdk.Operation | null {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private buildOperationFromDto(op: any): any {
     try {
       switch (op.type) {
         case 'payment':

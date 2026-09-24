@@ -1,7 +1,26 @@
-import { Injectable, BadRequestException } from '@nestjs/common';
-import * as StellarSdk from '@stellar/stellar-sdk';
-import { BuildTransactionDto } from './dto/build-transaction.dto';
+import {
+  BadRequestException,
+  Injectable,
+  Logger,
+} from '@nestjs/common';
+import {
+  Account,
+  Asset,
+  BASE_FEE,
+  Horizon,
+  Keypair,
+  Memo,
+  Networks,
+  Operation,
+  StrKey,
+  Transaction,
+  TransactionBuilder,
+  xdr,
+} from '@stellar/stellar-sdk';
+import { BuildTransactionDto, OperationDto } from './dto/build-transaction.dto';
 import { SimulateTransactionDto } from './dto/simulate-transaction.dto';
+import { BenchmarkTransactionDto } from './dto/benchmark-transaction.dto';
+import { FeeBumpDto } from './dto/fee-bump.dto';
 
 // ---------------------------------------------------------------------------
 // Static operation-type manifest returned by GET /composer/operations
@@ -161,42 +180,36 @@ interface CachedSimulation {
   expiresAt: number;
 }
 
-interface TransactionSequenceStep {
-  build: BuildTransactionDto;
-  dependsOn?: number;
+interface CachedSequence {
+  sequence: string;
+  expiresAt: number;
 }
 
-interface RunTransactionSequenceDto {
-  network?: 'testnet' | 'mainnet';
-  signerSecret: string;
-  transactions: TransactionSequenceStep[];
-  stopOnFailure?: boolean;
+function isNativeAssetCode(code: string | undefined): boolean {
+  return code === 'native' || code === 'XLM' || !code;
 }
 
-interface TransactionSequenceStepResult {
-  index: number;
-  hash: string | null;
-  status: 'succeeded' | 'failed' | 'skipped';
-  resultCodes: unknown;
-  nextSequenceNumber: string;
-}
-
-interface TransactionSequenceRunRecord {
-  id: string;
-  network: 'testnet' | 'mainnet';
-  stopOnFailure: boolean;
-  startedAt: string;
-  endedAt?: string;
-  status: 'running' | 'succeeded' | 'failed' | 'partial';
-  steps: TransactionSequenceStepResult[];
+function resolveAsset(code: string | undefined, issuer?: string): Asset {
+  if (isNativeAssetCode(code)) {
+    return Asset.native();
+  }
+  if (!code) {
+    throw new BadRequestException('Asset code is required');
+  }
+  if (!issuer) {
+    throw new BadRequestException(`Asset ${code} requires an issuer`);
+  }
+  return new Asset(code, issuer);
 }
 
 @Injectable()
 export class ComposerService {
   private readonly logger = new Logger(ComposerService.name);
   private readonly simulationCache = new Map<string, CachedSimulation>();
+  private readonly sequenceCache = new Map<string, CachedSequence>();
   private readonly MAX_CACHE_SIZE = 1000;
   private readonly CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+  private readonly SEQUENCE_TTL_MS = 30 * 1000; // 30 seconds
 
   getOperations() {
     return OPERATION_MANIFEST;
@@ -210,60 +223,195 @@ export class ComposerService {
     return new Horizon.Server(url);
   }
 
-  buildTransaction(dto: BuildTransactionDto) {
+  private networkPassphrase(network: 'testnet' | 'mainnet' = 'testnet'): string {
+    return network === 'mainnet' ? Networks.PUBLIC : Networks.TESTNET;
+  }
+
+  private async loadSequenceNumber(
+    sourceAccount: string,
+    network: 'testnet' | 'mainnet',
+  ): Promise<string> {
+    const cacheKey = `${network}:${sourceAccount}`;
+    const now = Date.now();
+    const cached = this.sequenceCache.get(cacheKey);
+    if (cached && cached.expiresAt > now) {
+      return cached.sequence;
+    }
+
+    const server = this.getHorizonServer(network);
     try {
-      const networkPassphrase =
-        dto.network === 'mainnet' ? Networks.PUBLIC : Networks.TESTNET;
+      const account = await server.loadAccount(sourceAccount);
+      const sequence = account.sequenceNumber();
+      this.sequenceCache.set(cacheKey, {
+        sequence,
+        expiresAt: now + this.SEQUENCE_TTL_MS,
+      });
+      return sequence;
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new BadRequestException(
+        `Failed to load sequence number for ${sourceAccount}: ${message}`,
+      );
+    }
+  }
 
-      const sourceAccount = new Horizon.Account(dto.sourceAccount, dto.sequenceNumber);
+  async buildTransaction(dto: BuildTransactionDto) {
+    try {
+      const network = dto.network || 'testnet';
+      const fee = dto.fee || BASE_FEE;
+      const passphrase = this.networkPassphrase(network);
 
+      const sequence =
+        dto.sequenceNumber !== undefined
+          ? dto.sequenceNumber
+          : await this.loadSequenceNumber(dto.sourceAccount, network);
+
+      const sourceAccount = new Account(dto.sourceAccount, sequence);
       const builder = new TransactionBuilder(sourceAccount, {
-        fee: dto.fee,
-        networkPassphrase,
+        fee,
+        networkPassphrase: passphrase,
       });
 
+      if (dto.timeBounds && dto.preconditions && dto.preconditions.length > 0) {
+        throw new BadRequestException('timeBounds and preconditions are mutually exclusive');
+      }
+
       if (dto.timeBounds) {
-        builder.setTimeBounds({
-          minTime: dto.timeBounds.minTime,
-          maxTime: dto.timeBounds.maxTime,
-        });
+        builder.setTimebounds(dto.timeBounds.minTime, dto.timeBounds.maxTime);
+      } else if (dto.preconditions && dto.preconditions.length > 0) {
+        this.applyPreconditions(builder, dto.preconditions);
+        const hasTimeBounds = dto.preconditions.some((p) => p.type === 'time_bounds');
+        if (!hasTimeBounds) {
+          // stellar-base requires time bounds whenever other preconditions are set
+          builder.setTimeout(0);
+        }
+      } else {
+        builder.setTimeout(30);
       }
 
       if (dto.memo) {
-        switch (dto.memo.type) {
-          case 'text':
-            builder.addMemo(Memo.text(dto.memo.value));
-            break;
-          case 'id':
-            builder.addMemo(Memo.id(dto.memo.value));
-            break;
-          case 'hash':
-            builder.addMemo(Memo.hash(dto.memo.value));
-            break;
-          case 'return':
-            builder.addMemo(Memo.return(dto.memo.value));
-            break;
-        }
+        builder.addMemo(Memo.text(dto.memo));
       }
 
       for (const opDto of dto.operations) {
-        const op = this.mapOperation(opDto);
-        builder.addOperation(op);
+        builder.addOperation(this.mapOperation(opDto));
       }
 
-      const transaction = builder.setTimeout(30).build();
-      const xdr = transaction.toEnvelope().toXDR().toString('base64');
+      const transaction = builder.build();
+      const xdr = transaction.toEnvelope().toXDR('base64');
       const hash = transaction.hash().toString('hex');
 
       return {
         xdr,
         hash,
-        fee: dto.fee,
+        fee,
         operationCount: dto.operations.length,
+        sequenceNumber: transaction.sequence,
+        network,
       };
     } catch (err: unknown) {
+      if (err instanceof BadRequestException) {
+        throw err;
+      }
       const message = err instanceof Error ? err.message : String(err);
       throw new BadRequestException(`Failed to build transaction: ${message}`);
+    }
+  }
+
+  async buildFeeBump(dto: FeeBumpDto) {
+    try {
+      const network = dto.network || 'testnet';
+      const passphrase = this.networkPassphrase(network);
+
+      let envelope: xdr.TransactionEnvelope;
+      try {
+        envelope = xdr.TransactionEnvelope.fromXDR(dto.innerXdr, 'base64');
+      } catch {
+        throw new BadRequestException('Invalid inner transaction XDR');
+      }
+
+      const envelopeType = envelope.switch().name;
+      if (envelopeType === 'envelopeTypeTxFeeBump') {
+        throw new BadRequestException(
+          'Inner envelope is already a fee-bump transaction',
+        );
+      }
+      if (envelopeType !== 'envelopeTypeTx' && envelopeType !== 'envelopeTypeTxV0') {
+        throw new BadRequestException(
+          'Inner envelope must be a classic transaction',
+        );
+      }
+      if (envelopeType === 'envelopeTypeTx' && Number(envelope.v1().tx().ext().switch()) !== 0) {
+        throw new BadRequestException(
+          'Soroban transactions cannot be fee-bumped',
+        );
+      }
+
+      if (!StrKey.isValidEd25519PublicKey(dto.feeSource)) {
+        throw new BadRequestException(
+          `Invalid fee source account: ${dto.feeSource}`,
+        );
+      }
+
+      let inner: Transaction;
+      try {
+        inner = new Transaction(dto.innerXdr, passphrase);
+      } catch {
+        throw new BadRequestException('Invalid inner transaction XDR');
+      }
+
+      const operationCount = inner.operations.length;
+      const baseFee = BigInt(dto.baseFee);
+      if (baseFee <= 0n) {
+        throw new BadRequestException('baseFee must be a positive integer');
+      }
+      if (baseFee * BigInt(operationCount) < BigInt(inner.fee)) {
+        throw new BadRequestException(
+          `baseFee is too low: ${baseFee} stroops x ${operationCount} operations must cover the inner fee of ${inner.fee} stroops`,
+        );
+      }
+
+      const maxTime = Number(inner.timeBounds?.maxTime ?? 0);
+      if (maxTime > 0 && maxTime * 1000 <= Date.now()) {
+        throw new BadRequestException('Inner transaction time bounds have expired');
+      }
+
+      if (inner.signatures.length > 0) {
+        const publicKey = Keypair.fromPublicKey(inner.source);
+        for (const signature of inner.signatures) {
+          const raw = signature.signature();
+          if (!raw || !publicKey.verify(inner.hash(), raw)) {
+            throw new BadRequestException(
+              'Network mismatch: inner transaction signatures are not valid for the requested network',
+            );
+          }
+        }
+      }
+
+      const feeBump = TransactionBuilder.buildFeeBumpTransaction(
+        dto.feeSource,
+        dto.baseFee,
+        inner,
+        passphrase,
+      );
+
+      return {
+        xdr: feeBump.toEnvelope().toXDR('base64'),
+        hash: feeBump.hash().toString('hex'),
+        innerHash: inner.hash().toString('hex'),
+        type: 'fee_bump' as const,
+        feeSource: dto.feeSource,
+        baseFee: dto.baseFee,
+        fee: (baseFee * BigInt(operationCount)).toString(),
+        operationCount,
+        network,
+      };
+    } catch (err: unknown) {
+      if (err instanceof BadRequestException) {
+        throw err;
+      }
+      const message = err instanceof Error ? err.message : String(err);
+      throw new BadRequestException(`Failed to build fee-bump: ${message}`);
     }
   }
 
@@ -275,18 +423,19 @@ export class ComposerService {
 
       if (cached) {
         if (cached.expiresAt > now) {
-          // Refresh position in LRU (delete and re-set)
           this.simulationCache.delete(cacheKey);
           this.simulationCache.set(cacheKey, cached);
           return cached.result;
-        } else {
-          this.simulationCache.delete(cacheKey);
         }
+        this.simulationCache.delete(cacheKey);
       }
 
       let tx: Transaction;
       try {
-        tx = new Transaction(dto.xdr, dto.network === 'mainnet' ? Networks.PUBLIC : Networks.TESTNET);
+        tx = new Transaction(
+          dto.xdr,
+          this.networkPassphrase(dto.network || 'testnet'),
+        );
       } catch {
         throw new BadRequestException('Invalid XDR');
       }
@@ -302,7 +451,6 @@ export class ComposerService {
         ledger: null,
       };
 
-      // Evict oldest entries if cache is at max capacity
       if (this.simulationCache.size >= this.MAX_CACHE_SIZE) {
         const oldestKey = this.simulationCache.keys().next().value;
         if (oldestKey !== undefined) {
@@ -327,7 +475,10 @@ export class ComposerService {
 
   async sendTransaction(dto: SimulateTransactionDto) {
     try {
-      const tx = new Transaction(dto.xdr, dto.network === 'mainnet' ? Networks.PUBLIC : Networks.TESTNET);
+      const tx = new Transaction(
+        dto.xdr,
+        this.networkPassphrase(dto.network || 'testnet'),
+      );
       const server = this.getHorizonServer(dto.network);
 
       const response = await server.submitTransaction(tx);
@@ -335,16 +486,19 @@ export class ComposerService {
       return {
         success: true,
         hash: response.hash,
-        fee: response.fee_charged,
+        fee: (response as { fee_charged?: string }).fee_charged ?? null,
         resultCodes: null,
         operationResults: null,
-        ledger: response.ledger,
+        ledger: (response as { ledger?: number }).ledger ?? null,
       };
     } catch (err: unknown) {
       const errObj = err as any;
-      const resultCodes = errObj?.response?.data?.extras?.result_codes || null;
+      const resultCodes =
+        errObj?.response?.data?.extras?.result_codes || null;
       const operationResults = resultCodes?.operations || null;
-      const txCode = resultCodes?.transaction || (err instanceof Error ? err.message : 'Transaction failed');
+      const txCode =
+        resultCodes?.transaction ||
+        (err instanceof Error ? err.message : 'Transaction failed');
 
       return {
         success: false,
@@ -353,143 +507,7 @@ export class ComposerService {
         resultCodes: txCode,
         operationResults,
         ledger: null,
-import { BenchmarkTransactionDto } from './dto/benchmark-transaction.dto';
-
-@Injectable()
-export class ComposerService {
-  private readonly servers = {
-    mainnet: new StellarSdk.Horizon.Server('https://horizon.stellar.org'),
-    testnet: new StellarSdk.Horizon.Server('https://horizon-testnet.stellar.org'),
-  };
-
-  private readonly passphrases = {
-    mainnet: StellarSdk.Networks.PUBLIC,
-    testnet: StellarSdk.Networks.TESTNET,
-  };
-
-  private readonly sequenceHistory: TransactionSequenceRunRecord[] = [];
-
-  async buildTransaction(dto: BuildTransactionDto) {
-    try {
-      const sourceKeypair = StellarSdk.Keypair.fromSecret(dto.signerSecret);
-      const network = dto.network || 'testnet';
-      const server = this.servers[network];
-      const passphrase = this.passphrases[network];
-
-      const account = await server.loadAccount(sourceKeypair.publicKey());
-      
-      let builder = new StellarSdk.TransactionBuilder(account, {
-        fee: dto.fee || StellarSdk.BASE_FEE,
-        networkPassphrase: passphrase,
-      });
-
-      if (dto.timeBounds) {
-        builder = builder.setTimeBounds(dto.timeBounds);
-      } else {
-        builder = builder.setTimeout(30);
-      }
-
-      for (const op of dto.operations) {
-        switch (op.type) {
-          case 'payment':
-            builder.addOperation(
-              StellarSdk.Operation.payment({
-                destination: op.destination,
-                asset:
-                  op.asset.code === 'native'
-                    ? StellarSdk.Asset.native()
-                    : new StellarSdk.Asset(op.asset.code, op.asset.issuer!),
-                amount: op.amount,
-              }),
-            );
-            break;
-          case 'create_account':
-            builder.addOperation(
-              StellarSdk.Operation.createAccount({
-                destination: op.destination,
-                startingBalance: op.startingBalance,
-              }),
-            );
-            break;
-          case 'change_trust':
-            builder.addOperation(
-              StellarSdk.Operation.changeTrust({
-                asset:
-                  op.asset.code === 'native'
-                    ? StellarSdk.Asset.native()
-                    : new StellarSdk.Asset(op.asset.code, op.asset.issuer!),
-                limit: op.limit,
-              }),
-            );
-            break;
-          case 'account_merge':
-            builder.addOperation(
-              StellarSdk.Operation.accountMerge({
-                destination: op.destination,
-              }),
-            );
-            break;
-          case 'set_options':
-            builder.addOperation(
-              StellarSdk.Operation.setOptions({
-                inflationDest: op.inflationDest,
-                clearFlags: op.clearFlags,
-                setFlags: op.setFlags,
-                masterWeight: op.masterWeight,
-                lowThreshold: op.lowThreshold,
-                medThreshold: op.medThreshold,
-                highThreshold: op.highThreshold,
-                homeDomain: op.homeDomain,
-              }),
-            );
-            break;
-          default:
-            throw new BadRequestException(`Unsupported operation type: ${(op as any).type}`);
-        }
-      }
-
-      const transaction = builder.build();
-      transaction.sign(sourceKeypair);
-      const xdr = transaction.toXDR();
-
-      return {
-        xdr,
-        hash: transaction.hash().toString('hex'),
-        feeCharged: transaction.fee,
-        operationsCount: transaction.operations.length,
       };
-    } catch (error: any) {
-      throw new BadRequestException(`Failed to build transaction: ${error.message}`);
-    }
-  }
-
-  async simulateTransaction(dto: SimulateTransactionDto) {
-    try {
-      const network = dto.network || 'testnet';
-      const server = this.servers[network];
-      const tx = new StellarSdk.Transaction(dto.xdr, this.passphrases[network]);
-
-      try {
-        const simulation = await server.simulateTransaction(tx);
-        return {
-          success: true,
-          fee: simulation.minFee,
-          resultCodes: simulation.results ? JSON.stringify(simulation.results) : 'success',
-          operationResults: simulation.results?.map((r: any) => r.code || 'success') || [],
-          hash: tx.hash().toString('hex'),
-        };
-      } catch (simError: any) {
-        return {
-          success: false,
-          fee: '100',
-          resultCodes: simError.response?.data?.extras?.result_codes?.transaction || 'tx_failed',
-          operationResults: simError.response?.data?.extras?.result_codes?.operations || [],
-          hash: tx.hash().toString('hex'),
-          error: simError.message,
-        };
-      }
-    } catch (error: any) {
-      throw new BadRequestException(`Simulation parsing failed: ${error.message}`);
     }
   }
 
@@ -499,9 +517,8 @@ export class ComposerService {
     const concurrency = Math.min(Math.max(dto.concurrency || 5, 1), 20);
 
     try {
-      const tx = new StellarSdk.Transaction(dto.xdr, this.passphrases[network]);
-      
-      // Helper to execute submissions
+      new Transaction(dto.xdr, this.networkPassphrase(network));
+
       const runBatch = async (mode: 'sequential' | 'concurrent') => {
         const latencies: number[] = [];
         let successCount = 0;
@@ -514,17 +531,15 @@ export class ComposerService {
           for (let i = 0; i < txCount; i++) {
             const t0 = Date.now();
             try {
-              // In benchmark mode, simulate submission or mock realistic latency respecting limits
               await new Promise((res) => setTimeout(res, 50 + Math.random() * 50));
               successCount++;
               latencies.push(Date.now() - t0);
-            } catch (err: any) {
+            } catch {
               failureCount++;
               latencies.push(Date.now() - t0);
             }
           }
         } else {
-          // Concurrent mode with sequence conflict simulation
           const chunks = Math.ceil(txCount / concurrency);
           for (let c = 0; c < chunks; c++) {
             const batchSize = Math.min(concurrency, txCount - c * concurrency);
@@ -532,14 +547,12 @@ export class ComposerService {
               const t0 = Date.now();
               try {
                 await new Promise((res) => setTimeout(res, 30 + Math.random() * 40));
-                // Simulate sequence conflict when multiple concurrent txs share exact same sequence
                 if (idx > 0 && Math.random() < 0.65) {
                   sequenceConflicts++;
                   failureCount++;
                   throw new Error('tx_bad_seq');
-                } else {
-                  successCount++;
                 }
+                successCount++;
                 latencies.push(Date.now() - t0);
               } catch (err: any) {
                 if (!err.message.includes('tx_bad_seq')) {
@@ -553,10 +566,15 @@ export class ComposerService {
         }
 
         const totalDurationMs = Date.now() - startTime;
-        const throughputTxPerSec = totalDurationMs > 0 ? parseFloat(((txCount / totalDurationMs) * 1000).toFixed(2)) : txCount;
-        
+        const throughputTxPerSec =
+          totalDurationMs > 0
+            ? parseFloat(((txCount / totalDurationMs) * 1000).toFixed(2))
+            : txCount;
+
         latencies.sort((a, b) => a - b);
-        const avgLatency = latencies.length ? Math.round(latencies.reduce((a, b) => a + b, 0) / latencies.length) : 0;
+        const avgLatency = latencies.length
+          ? Math.round(latencies.reduce((a, b) => a + b, 0) / latencies.length)
+          : 0;
         const p50 = latencies.length ? latencies[Math.floor(latencies.length * 0.5)] : 0;
         const p95 = latencies.length ? latencies[Math.floor(latencies.length * 0.95)] : 0;
         const p99 = latencies.length ? latencies[Math.floor(latencies.length * 0.99)] : 0;
@@ -593,84 +611,51 @@ export class ComposerService {
     }
   }
 
-  private mapOperation(dto: OperationDto): Operation.Operation {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  mapOperation(dto: OperationDto): any {
     switch (dto.type) {
-      case 'payment': {
-        const asset =
-          dto.asset.code === 'native' || !dto.asset.code
-            ? Asset.native()
-            : new Asset(dto.asset.code, dto.asset.issuer!);
+      case 'payment':
         return Operation.payment({
           destination: dto.destination,
-          asset,
+          asset: resolveAsset(dto.asset.code, dto.asset.issuer),
           amount: dto.amount,
         });
-      }
       case 'create_account':
         return Operation.createAccount({
           destination: dto.destination,
           startingBalance: dto.startingBalance,
         });
-      case 'change_trust': {
-        const asset = new Asset(dto.asset.code, dto.asset.issuer!);
+      case 'change_trust':
         return Operation.changeTrust({
-          asset,
+          asset: resolveAsset(dto.asset.code, dto.asset.issuer),
           limit: dto.limit,
         });
-      }
-      case 'manage_sell_offer': {
-        const selling =
-          dto.selling.code === 'native' || !dto.selling.code
-            ? Asset.native()
-            : new Asset(dto.selling.code, dto.selling.issuer!);
-        const buying =
-          dto.buying.code === 'native' || !dto.buying.code
-            ? Asset.native()
-            : new Asset(dto.buying.code, dto.buying.issuer!);
+      case 'manage_sell_offer':
         return Operation.manageSellOffer({
-          selling,
-          buying,
+          selling: resolveAsset(dto.selling.code, dto.selling.issuer),
+          buying: resolveAsset(dto.buying.code, dto.buying.issuer),
           amount: dto.amount,
           price: { n: Number(dto.price.n), d: Number(dto.price.d) },
           offerId: dto.offerId ? Number(dto.offerId) : undefined,
         });
-      }
-      case 'manage_buy_offer': {
-        const selling =
-          dto.selling.code === 'native' || !dto.selling.code
-            ? Asset.native()
-            : new Asset(dto.selling.code, dto.selling.issuer!);
-        const buying =
-          dto.buying.code === 'native' || !dto.buying.code
-            ? Asset.native()
-            : new Asset(dto.buying.code, dto.buying.issuer!);
+      case 'manage_buy_offer':
         return Operation.manageBuyOffer({
-          selling,
-          buying,
+          selling: resolveAsset(dto.selling.code, dto.selling.issuer),
+          buying: resolveAsset(dto.buying.code, dto.buying.issuer),
           buyAmount: dto.buyAmount,
           price: { n: Number(dto.price.n), d: Number(dto.price.d) },
           offerId: dto.offerId ? Number(dto.offerId) : undefined,
         });
-      }
-      case 'create_passive_sell_offer': {
-        const selling =
-          dto.selling.code === 'native' || !dto.selling.code
-            ? Asset.native()
-            : new Asset(dto.selling.code, dto.selling.issuer!);
-        const buying =
-          dto.buying.code === 'native' || !dto.buying.code
-            ? Asset.native()
-            : new Asset(dto.buying.code, dto.buying.issuer!);
+      case 'create_passive_sell_offer':
         return Operation.createPassiveSellOffer({
-          selling,
-          buying,
+          selling: resolveAsset(dto.selling.code, dto.selling.issuer),
+          buying: resolveAsset(dto.buying.code, dto.buying.issuer),
           amount: dto.amount,
           price: { n: Number(dto.price.n), d: Number(dto.price.d) },
         });
-      }
       case 'set_options':
         return Operation.setOptions({
-          inflationDestination: dto.inflationDest,
+          inflationDest: dto.inflationDest,
           clearFlags: dto.clearFlags,
           setFlags: dto.setFlags,
           masterWeight: dto.masterWeight,
@@ -690,43 +675,27 @@ export class ComposerService {
           authorize: dto.authorize,
         });
       case 'path_payment_strict_send': {
-        const sendAsset =
-          dto.sendAsset.code === 'native' || !dto.sendAsset.code
-            ? Asset.native()
-            : new Asset(dto.sendAsset.code, dto.sendAsset.issuer!);
-        const destAsset =
-          dto.destAsset.code === 'native' || !dto.destAsset.code
-            ? Asset.native()
-            : new Asset(dto.destAsset.code, dto.destAsset.issuer!);
-        const path = (dto.path || []).map((a) =>
-          a.code === 'native' || !a.code ? Asset.native() : new Asset(a.code, a.issuer!),
+        const path = ((dto.path as Array<{ code?: string; issuer?: string }> | undefined) || []).map(
+          (a) => resolveAsset(a.code, a.issuer),
         );
         return Operation.pathPaymentStrictSend({
-          sendAsset,
+          sendAsset: resolveAsset(dto.sendAsset.code, dto.sendAsset.issuer),
           sendAmount: dto.sendAmount,
           destination: dto.destination,
-          destAsset,
+          destAsset: resolveAsset(dto.destAsset.code, dto.destAsset.issuer),
           destMin: dto.destMin,
           path,
         });
       }
       case 'path_payment_strict_receive': {
-        const sendAsset =
-          dto.sendAsset.code === 'native' || !dto.sendAsset.code
-            ? Asset.native()
-            : new Asset(dto.sendAsset.code, dto.sendAsset.issuer!);
-        const destAsset =
-          dto.destAsset.code === 'native' || !dto.destAsset.code
-            ? Asset.native()
-            : new Asset(dto.destAsset.code, dto.destAsset.issuer!);
-        const path = (dto.path || []).map((a) =>
-          a.code === 'native' || !a.code ? Asset.native() : new Asset(a.code, a.issuer!),
+        const path = ((dto.path as Array<{ code?: string; issuer?: string }> | undefined) || []).map(
+          (a) => resolveAsset(a.code, a.issuer),
         );
         return Operation.pathPaymentStrictReceive({
-          sendAsset,
+          sendAsset: resolveAsset(dto.sendAsset.code, dto.sendAsset.issuer),
           sendMax: dto.sendMax,
           destination: dto.destination,
-          destAsset,
+          destAsset: resolveAsset(dto.destAsset.code, dto.destAsset.issuer),
           destAmount: dto.destAmount,
           path,
         });
@@ -734,161 +703,76 @@ export class ComposerService {
       case 'manage_data':
         return Operation.manageData({
           name: dto.name,
-          value: dto.value ? Buffer.from(dto.value) : undefined,
+          value: dto.value ? Buffer.from(dto.value) : null,
         });
       default:
         throw new BadRequestException(`Unknown operation type: ${(dto as any).type}`);
     }
   }
 
-  async runTransactionSequence(dto: RunTransactionSequenceDto) {
-    const network = (dto.network || 'testnet') as 'testnet' | 'mainnet';
-    const server = this.servers[network];
-    const passphrase = this.passphrases[network];
-
-    if (!dto.transactions || dto.transactions.length === 0) {
-      throw new BadRequestException('Transaction sequence must contain at least one transaction');
-    }
-
-    this.validateSequenceDependencies(dto.transactions);
-
-    const keypair = StellarSdk.Keypair.fromSecret(dto.signerSecret);
-    const account = await server.loadAccount(keypair.publicKey());
-
-    const record: TransactionSequenceRunRecord = {
-      id: `seq_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`,
-      network,
-      stopOnFailure: dto.stopOnFailure !== false,
-      startedAt: new Date().toISOString(),
-      status: 'running',
-      steps: [],
-    };
-
-    this.sequenceHistory.unshift(record);
-
-    for (let index = 0; index < dto.transactions.length; index++) {
-      const stepResult: TransactionSequenceStepResult = {
-        index,
-        hash: null,
-        status: 'failed',
-        resultCodes: null,
-        nextSequenceNumber: (BigInt(account.sequenceNumber()) + 1n).toString(),
-      };
-
-      try {
-        const step = this.resolveStepReferences(dto.transactions, index, record.steps);
-        const transaction = this.buildSequenceTransaction(step, account, keypair, passphrase);
-        const submitted = await server.submitTransaction(transaction);
-        stepResult.status = 'succeeded';
-        stepResult.hash = submitted.hash;
-      } catch (error: any) {
-        stepResult.status = 'failed';
-        stepResult.resultCodes =
-          error?.response?.data?.extras?.result_codes?.transaction ||
-          error?.message ||
-          String(error);
-
-        if (dto.stopOnFailure !== false) {
-          record.steps.push(stepResult);
-          record.status = record.steps.some((s) => s.status === 'succeeded') ? 'partial' : 'failed';
-          record.endedAt = new Date().toISOString();
-          return record;
-        }
-      }
-
-      stepResult.nextSequenceNumber = (BigInt(account.sequenceNumber()) + 1n).toString();
-      record.steps.push(stepResult);
-    }
-
-    record.status = record.steps.every((s) => s.status === 'succeeded') ? 'succeeded' : 'partial';
-    record.endedAt = new Date().toISOString();
-    return record;
-  }
-
-  getSequenceHistory(): TransactionSequenceRunRecord[] {
-    return this.sequenceHistory;
-  }
-
-  private buildSequenceTransaction(
-    step: TransactionSequenceStep,
-    account: StellarSdk.Account,
-    keypair: StellarSdk.Keypair,
-    passphrase: string,
-  ): StellarSdk.Transaction {
-    const builder = new StellarSdk.TransactionBuilder(account, {
-      fee: step.build.fee || StellarSdk.BASE_FEE,
-      networkPassphrase: passphrase,
-    });
-
-    if (step.build.timeBounds) {
-      builder.setTimeBounds(step.build.timeBounds);
-    } else {
-      builder.setTimeout(30);
-    }
-
-    for (const op of step.build.operations) {
-      builder.addOperation(this.mapOperation(op));
-    }
-
-    const transaction = builder.build();
-    transaction.sign(keypair);
-    return transaction;
-  }
-
-  private validateSequenceDependencies(steps: TransactionSequenceStep[]) {
-    for (let index = 0; index < steps.length; index++) {
-      const dep = steps[index].dependsOn;
-      if (dep !== undefined && dep !== null) {
-        if (typeof dep !== 'number' || !Number.isInteger(dep) || dep < 0 || dep >= index) {
-          throw new BadRequestException(
-            `Step ${index} has invalid dependency reference: ${dep}`,
-          );
-        }
-      }
-
-      if (steps[index].build) {
-        const raw = JSON.stringify(steps[index].build);
-        const matches = raw.match(/\{steps\.(\d+)\.(hash|nextSequenceNumber)\}/g) || [];
-        for (const match of matches) {
-          const refIndex = Number(match.match(/\{steps\.(\d+)\./)?.[1]);
-          if (!Number.isInteger(refIndex) || refIndex < 0 || refIndex >= index) {
+  private applyPreconditions(
+    builder: TransactionBuilder,
+    preconditions: NonNullable<BuildTransactionDto['preconditions']>,
+  ): void {
+    for (const precondition of preconditions) {
+      switch (precondition.type) {
+        case 'time_bounds':
+          if (precondition.minTime === undefined || precondition.maxTime === undefined) {
             throw new BadRequestException(
-              `Step ${index} has invalid dependency reference: ${match}`,
+              'time_bounds precondition requires minTime and maxTime',
             );
           }
+          if (precondition.minTime > precondition.maxTime) {
+            throw new BadRequestException(
+              'time_bounds minTime must be less than or equal to maxTime',
+            );
+          }
+          builder.setTimebounds(precondition.minTime, precondition.maxTime);
+          break;
+        case 'ledger_bounds':
+          if (precondition.minLedger === undefined || precondition.maxLedger === undefined) {
+            throw new BadRequestException(
+              'ledger_bounds precondition requires minLedger and maxLedger',
+            );
+          }
+          if (precondition.minLedger < 0 || precondition.maxLedger < 0) {
+            throw new BadRequestException('ledger bounds must be non-negative');
+          }
+          if (precondition.minLedger > precondition.maxLedger) {
+            throw new BadRequestException(
+              'ledger_bounds minLedger must be less than or equal to maxLedger',
+            );
+          }
+          builder.setLedgerbounds(precondition.minLedger, precondition.maxLedger);
+          break;
+        case 'min_sequence': {
+          if (!precondition.minSequence) {
+            throw new BadRequestException('min_sequence precondition requires minSequence');
+          }
+          const minSeq = BigInt(precondition.minSequence);
+          if (minSeq <= 0n) {
+            throw new BadRequestException('minSequence must be a positive integer string');
+          }
+          builder.setMinAccountSequence(precondition.minSequence);
+          if (precondition.minLedgerAge !== undefined) {
+            if (precondition.minLedgerAge <= 0) {
+              throw new BadRequestException('minLedgerAge must be positive');
+            }
+            builder.setMinAccountSequenceAge(precondition.minLedgerAge);
+          }
+          if (precondition.maxLedgerAhead !== undefined) {
+            if (precondition.maxLedgerAhead <= 0) {
+              throw new BadRequestException('maxLedgerAhead must be positive');
+            }
+            builder.setMinAccountSequenceLedgerGap(precondition.maxLedgerAhead);
+          }
+          break;
         }
-      }
-    }
-  }
-
-  private resolveStepReferences(
-    steps: TransactionSequenceStep[],
-    index: number,
-    results: TransactionSequenceStepResult[],
-  ): TransactionSequenceStep {
-    const step = steps[index];
-    if (!step.build) {
-      return step;
-    }
-
-    const raw = JSON.stringify(step.build);
-    const resolved = raw.replace(
-      /\{steps\.(\d+)\.(hash|nextSequenceNumber)\}/g,
-      (match, stepIndex: string, field: string) => {
-        const result = results[Number(stepIndex)];
-        if (!result || result.status !== 'succeeded') {
+        default:
           throw new BadRequestException(
-            `Step ${index} references step ${stepIndex} which has not succeeded`,
+            `Unknown precondition type: ${(precondition as any).type}`,
           );
-        }
-        return String((result as any)[field] ?? '');
-      },
-    );
-
-    try {
-      return { ...step, build: JSON.parse(resolved) };
-    } catch (error: any) {
-      throw new BadRequestException(`Failed to resolve step ${index} references: ${error.message}`);
+      }
     }
   }
 }

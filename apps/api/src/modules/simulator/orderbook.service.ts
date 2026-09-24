@@ -6,7 +6,9 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createClient, RedisClientType } from 'redis';
-import { getHorizonUrl, parseAssetParams, fetchFromHorizon } from './horizon.util';
+import { getHorizonUrl, parseAssetParams, fetchFromHorizon, ParsedAsset } from './horizon.util';
+import { TradesQueryDto, OrderQuoteDto } from './dto/trades.dto';
+import { BadRequestException } from '@nestjs/common';
 
 export type OrderbookNetwork = 'mainnet' | 'testnet';
 
@@ -36,6 +38,144 @@ export interface MidPriceSnapshot {
   timestamp: number;
   midPrice: string;
 }
+
+export interface TradeRow {
+  id: string;
+  pagingToken: string;
+  operationId: string | null;
+  ledger: number | null;
+  closeTime: string | null;
+  tradeType: string;
+  baseAsset: string;
+  quoteAsset: string;
+  price: string;
+  baseAmount: string;
+  quoteAmount: string;
+  buyer: string;
+  seller: string;
+  side: 'buy' | 'sell';
+}
+
+export interface TradeTapeResult {
+  selling: string;
+  buying: string;
+  network: OrderbookNetwork;
+  order: 'asc' | 'desc';
+  limit: number;
+  cursor: string | null;
+  trades: TradeRow[];
+  nextCursor: string | null;
+  hasMore: boolean;
+  truncated: boolean;
+  lastUpdated: number;
+}
+
+export type QuoteStatus = 'filled' | 'partial' | 'unfilled';
+
+export interface OrderQuoteResult {
+  selling: string;
+  buying: string;
+  network: OrderbookNetwork;
+  side: 'buy' | 'sell';
+  requestedAmount: string;
+  filledAmount: string;
+  unfilledAmount: string;
+  status: QuoteStatus;
+  averagePrice: string | null;
+  worstPrice: string | null;
+  bestPrice: string | null;
+  cost: string;
+  priceImpactBps: number | null;
+  estimatedFee: string;
+  levelsConsumed: number;
+  lastUpdated: number;
+}
+
+const FIXED_SCALE = 10_000_000n;
+const MAX_TRADE_PAGES = 5;
+const ESTIMATED_TRADE_FEE_STROOPS = '100';
+
+function parseFixed(value: string): bigint {
+  const match = /^(\d+)(?:\.(\d{1,7}))?$/.exec(value);
+  if (!match) {
+    throw new BadRequestException(
+      `Invalid decimal value: "${value}" (expected a non-negative decimal with at most 7 fractional digits)`,
+    );
+  }
+  const whole = BigInt(match[1]);
+  const fraction = match[2] ? BigInt(match[2].padEnd(7, '0')) : 0n;
+  return whole * FIXED_SCALE + fraction;
+}
+
+function formatFixed(value: bigint): string {
+  const negative = value < 0n;
+  const abs = negative ? -value : value;
+  const whole = abs / FIXED_SCALE;
+  const fraction = (abs % FIXED_SCALE).toString().padStart(7, '0');
+  return `${negative ? '-' : ''}${whole}.${fraction}`;
+}
+
+function mulFixed(a: bigint, b: bigint): bigint {
+  return (a * b) / FIXED_SCALE;
+}
+
+function divFixed(a: bigint, b: bigint): bigint {
+  if (b === 0n) {
+    throw new BadRequestException('Division by zero');
+  }
+  return (a * FIXED_SCALE) / b;
+}
+
+function formatAssetString(asset: ParsedAsset): string {
+  if (asset.type === 'native' || !asset.code) return 'XLM';
+  return `${asset.code}:${asset.issuer ?? ''}`;
+}
+
+function formatPriceRatio(price: unknown): string {
+  if (typeof price === 'string') {
+    return formatFixed(parseFixed(price));
+  }
+  if (price && typeof price === 'object' && 'n' in price && 'd' in price) {
+    const n = BigInt(String((price as { n: unknown }).n));
+    const d = BigInt(String((price as { d: unknown }).d));
+    if (d === 0n) throw new BadRequestException('Invalid trade price');
+    return formatFixed((n * FIXED_SCALE) / d);
+  }
+  throw new BadRequestException('Invalid trade price in Horizon response');
+}
+
+function mapHorizonTrade(record: any): TradeRow {
+  const baseAsset = formatAssetString({
+    type: record.base_asset_type,
+    code: record.base_asset_code,
+    issuer: record.base_asset_issuer,
+  });
+  const quoteAsset = formatAssetString({
+    type: record.counter_asset_type,
+    code: record.counter_asset_code,
+    issuer: record.counter_asset_issuer,
+  });
+  const baseIsSeller = record.base_is_seller === true;
+  const closeTime = record.ledger_close_time ?? record.created_at ?? null;
+  const id = String(record.id ?? record.paging_token ?? '');
+  return {
+    id,
+    pagingToken: String(record.paging_token ?? ''),
+    operationId: id ? id.split('-')[0] : null,
+    ledger: typeof record.ledger === 'number' ? record.ledger : null,
+    closeTime,
+    tradeType: String(record.trade_type ?? record.operation_type ?? 'orderbook'),
+    baseAsset,
+    quoteAsset,
+    price: formatPriceRatio(record.price),
+    baseAmount: String(record.base_amount ?? '0'),
+    quoteAmount: String(record.counter_amount ?? '0'),
+    buyer: baseIsSeller ? String(record.counter_account ?? '') : String(record.base_account ?? ''),
+    seller: baseIsSeller ? String(record.base_account ?? '') : String(record.counter_account ?? ''),
+    side: baseIsSeller ? 'sell' : 'buy',
+  };
+}
+
 
 interface HorizonOrderBookLevel {
   price: string;
@@ -295,5 +435,185 @@ export class OrderbookService implements OnModuleInit, OnModuleDestroy {
       this.logger.error('Failed to read order book history', err as Error);
       return [];
     }
+  }
+
+  async getTrades(query: TradesQueryDto): Promise<TradeTapeResult> {
+    const network: OrderbookNetwork = query.network ?? 'testnet';
+    const selling = query.selling;
+    const buying = query.buying;
+    const sell = parseAssetParams(selling);
+    const buy = parseAssetParams(buying);
+    const horizonUrl = getHorizonUrl(network);
+    const limit = Math.min(Math.max(query.limit ?? 50, 1), 200);
+    const order: 'asc' | 'desc' = query.order ?? 'desc';
+
+    const trades: TradeRow[] = [];
+    let cursor = query.cursor;
+    let lastScannedToken: string | null = query.cursor ?? null;
+    let pages = 0;
+    let stopReason: 'limit' | 'end-of-data' | 'window-end' | 'scan-bound' | null = null;
+
+    while (trades.length < limit && pages < MAX_TRADE_PAGES) {
+      const params = new URLSearchParams({ limit: String(limit), order });
+      params.set('base_asset_type', sell.type);
+      if (sell.code) params.set('base_asset_code', sell.code);
+      if (sell.issuer) params.set('base_asset_issuer', sell.issuer);
+      params.set('counter_asset_type', buy.type);
+      if (buy.code) params.set('counter_asset_code', buy.code);
+      if (buy.issuer) params.set('counter_asset_issuer', buy.issuer);
+      if (cursor) params.set('cursor', cursor);
+
+      const data = await fetchFromHorizon(`${horizonUrl}/trades?${params.toString()}`);
+      const batch: any[] = data?._embedded?.records ?? [];
+      if (batch.length === 0) {
+        stopReason = 'end-of-data';
+        break;
+      }
+      pages++;
+
+      let windowExhausted = false;
+      for (const record of batch) {
+        lastScannedToken = String(record.paging_token ?? '') || lastScannedToken;
+
+        const closeMs = Date.parse(
+          String(record.ledger_close_time ?? record.created_at ?? ''),
+        );
+        if (!Number.isNaN(closeMs)) {
+          const closeSeconds = Math.floor(closeMs / 1000);
+          if (query.startTime !== undefined && closeSeconds < query.startTime) {
+            if (order === 'desc') {
+              windowExhausted = true;
+              break;
+            }
+            continue;
+          }
+          if (query.endTime !== undefined && closeSeconds > query.endTime) {
+            if (order === 'asc') {
+              windowExhausted = true;
+              break;
+            }
+            continue;
+          }
+        }
+
+        const row = mapHorizonTrade(record);
+        if (query.side && row.side !== query.side) continue;
+        if (query.account && row.buyer !== query.account && row.seller !== query.account) {
+          continue;
+        }
+
+        trades.push(row);
+        if (trades.length >= limit) break;
+      }
+
+      if (windowExhausted) {
+        stopReason = 'window-end';
+        break;
+      }
+      if (trades.length >= limit) {
+        stopReason = 'limit';
+        break;
+      }
+      cursor = String(batch[batch.length - 1].paging_token ?? '');
+      if (batch.length < limit) {
+        stopReason = 'end-of-data';
+        break;
+      }
+    }
+
+    if (stopReason === null) {
+      stopReason = 'scan-bound';
+    }
+
+    let nextCursor: string | null = null;
+    if (stopReason === 'limit' && trades.length > 0) {
+      nextCursor = trades[trades.length - 1].pagingToken;
+    } else if (stopReason === 'scan-bound' && lastScannedToken) {
+      nextCursor = lastScannedToken;
+    }
+
+    return {
+      selling,
+      buying,
+      network,
+      order,
+      limit,
+      cursor: query.cursor ?? null,
+      trades,
+      nextCursor,
+      hasMore: nextCursor !== null,
+      truncated: stopReason === 'scan-bound' && nextCursor !== null,
+      lastUpdated: Date.now(),
+    };
+  }
+
+  async getQuote(dto: OrderQuoteDto): Promise<OrderQuoteResult> {
+    const network: OrderbookNetwork = dto.network ?? 'testnet';
+    const requested = parseFixed(dto.amount);
+    if (requested <= 0n) {
+      throw new BadRequestException('amount must be positive');
+    }
+
+    const raw = await this.fetchHorizonOrderBook(dto.selling, dto.buying, network);
+    const side = dto.side;
+
+    const levels = (side === 'buy' ? (raw.asks ?? []) : (raw.bids ?? []))
+      .map((level) => ({
+        price: parseFixed(level.price),
+        amount: parseFixed(level.amount),
+      }))
+      .filter((level) => level.price > 0n && level.amount > 0n)
+      .sort((a, b) => {
+        if (a.price === b.price) return 0;
+        if (side === 'buy') return a.price < b.price ? -1 : 1;
+        return a.price > b.price ? -1 : 1;
+      });
+
+    let remaining = requested;
+    let filled = 0n;
+    let cost = 0n;
+    let worstPrice: bigint | null = null;
+    let levelsConsumed = 0;
+
+    for (const level of levels) {
+      if (remaining <= 0n) break;
+      const take = level.amount < remaining ? level.amount : remaining;
+      filled += take;
+      cost += mulFixed(take, level.price);
+      remaining -= take;
+      worstPrice = level.price;
+      levelsConsumed++;
+    }
+
+    const status: QuoteStatus =
+      filled === requested ? 'filled' : filled === 0n ? 'unfilled' : 'partial';
+    const averagePrice = filled > 0n ? divFixed(cost, filled) : null;
+    const bestPrice = levelsConsumed > 0 ? levels[0].price : null;
+
+    let priceImpactBps: number | null = null;
+    if (averagePrice !== null && bestPrice !== null && bestPrice > 0n) {
+      const delta = side === 'buy' ? averagePrice - bestPrice : bestPrice - averagePrice;
+      const bps = (delta * 10000n) / bestPrice;
+      priceImpactBps = bps > 0n ? Number(bps) : 0;
+    }
+
+    return {
+      selling: dto.selling,
+      buying: dto.buying,
+      network,
+      side,
+      requestedAmount: formatFixed(requested),
+      filledAmount: formatFixed(filled),
+      unfilledAmount: formatFixed(remaining),
+      status,
+      averagePrice: averagePrice !== null ? formatFixed(averagePrice) : null,
+      worstPrice: worstPrice !== null ? formatFixed(worstPrice) : null,
+      bestPrice: bestPrice !== null ? formatFixed(bestPrice) : null,
+      cost: formatFixed(cost),
+      priceImpactBps,
+      estimatedFee: filled > 0n ? ESTIMATED_TRADE_FEE_STROOPS : '0',
+      levelsConsumed,
+      lastUpdated: Date.now(),
+    };
   }
 }

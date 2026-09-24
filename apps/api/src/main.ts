@@ -47,11 +47,12 @@ async function bootstrap() {
 
   // Block GraphQL introspection in production
   if (nodeEnv === 'production') {
-    const fastify = app.getHttpAdapter().getInstance();
-    fastify.addHook('preHandler', async (request, reply) => {
+    const fastify = app.getHttpAdapter().getInstance() as any;
+    fastify.addHook('preHandler', async (request: any, reply: any) => {
+      const body = request.body;
       const rawQuery =
-        (request.body && typeof request.body === 'object' && request.body.query) ||
-        (request.body && typeof request.body === 'string' ? request.body : null) ||
+        (body && typeof body === 'object' && body.query) ||
+        (typeof body === 'string' ? body : null) ||
         (request.query && request.query.query) ||
         null;
 
