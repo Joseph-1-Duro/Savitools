@@ -441,8 +441,23 @@ export function ContractEventsTool() {
   const [latestLedger, setLatestLedger] = useState<number | null>(null);
   const [elapsedMs, setElapsedMs] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState('');
+  const [cursorError, setCursorError] = useState('');
   const [hasQueried, setHasQueried] = useState(false);
+
+  // Identifies the active query (contract + network + event type + range).
+  // Any change here invalidates the current cursor/page and forces a reset
+  // on the next fetch, instead of silently mixing pages from two queries.
+  const [queryKey, setQueryKey] = useState('');
+  const [cursor, setCursor] = useState<string | null>(null);
+  const [hasMore, setHasMore] = useState(false);
+
+  const currentQueryKey = useMemo(
+    () => JSON.stringify({ contractId: contractId.trim(), network, eventType, startLedger: startLedger.trim() }),
+    [contractId, network, eventType, startLedger],
+  );
 
   const [criteria, setCriteria] = useState<EventFilterCriterion[]>([]);
   const [draftKind, setDraftKind] = useState<EventFilterCriterion['kind']>('topic_contains');
@@ -458,8 +473,24 @@ export function ContractEventsTool() {
   // Filtering runs locally so narrowing is instant with no round-trip.
   const filtered = useMemo(() => applyEventFilters(events, criteria), [events, criteria]);
 
+  const dedupe = (existing: DecodedContractEvent[], incoming: DecodedContractEvent[]) => {
+    const seen = new Set(existing.map((e) => e.id));
+    const merged = [...existing];
+    for (const event of incoming) {
+      if (!seen.has(event.id)) {
+        seen.add(event.id);
+        merged.push(event);
+      }
+    }
+    return merged;
+  };
+
+  const effectiveLimit = () => Number(limit) || 100;
+
+  // Fresh query: replaces the event list and resets pagination.
   const load = async () => {
     setError('');
+    setCursorError('');
     setLoading(true);
     setReplaySummary(null);
     const startedAt = performance.now();
@@ -469,7 +500,7 @@ export function ContractEventsTool() {
         contractId: contractId.trim(),
         network,
         type: eventType,
-        limit: Number(limit) || 100,
+        limit: effectiveLimit(),
         ...(startLedger.trim() ? { startLedger: Number(startLedger) } : {}),
       });
 
@@ -477,13 +508,101 @@ export function ContractEventsTool() {
       setLatestLedger(result.latestLedger);
       setElapsedMs(Math.round(performance.now() - startedAt));
       setHasQueried(true);
+      setQueryKey(currentQueryKey);
+      setCursor(result.cursor);
+      setHasMore(result.events.length >= effectiveLimit());
     } catch (err) {
       setEvents([]);
       setError(err instanceof Error ? err.message : 'Failed to load events');
       setHasQueried(true);
+      setQueryKey(currentQueryKey);
+      setCursor(null);
+      setHasMore(false);
     } finally {
       setLoading(false);
     }
+  };
+
+  // Loads the next page using the RPC cursor, preserving already-loaded
+  // events and all active filters. If the query identity has changed since
+  // the last fetch, falls back to a fresh load instead of paging a stale
+  // query.
+  const loadOlder = async () => {
+    if (currentQueryKey !== queryKey || !cursor) {
+      await load();
+      return;
+    }
+
+    setError('');
+    setCursorError('');
+    setLoadingMore(true);
+    try {
+      const result = await getContractEvents({
+        contractId: contractId.trim(),
+        network,
+        type: eventType,
+        limit: effectiveLimit(),
+        cursor,
+      });
+
+      setEvents((prev) => dedupe(prev, result.events));
+      setLatestLedger(result.latestLedger);
+      setCursor(result.cursor);
+      setHasMore(result.events.length >= effectiveLimit());
+    } catch (err) {
+      setHasMore(false);
+      setCursorError(
+        err instanceof Error
+          ? `Could not load more events: ${err.message}. The cursor may be expired or invalid.`
+          : 'Could not load more events. The cursor may be expired or invalid.',
+      );
+    } finally {
+      setLoadingMore(false);
+    }
+  };
+
+  // Refetches from the latest ledger and merges any new events into the
+  // existing list, deduplicating against what's already loaded. Does not
+  // touch pagination state for "load older" (the cursor for the tail of the
+  // list is untouched).
+  const refresh = async () => {
+    if (!contractId.trim()) return;
+    setError('');
+    setCursorError('');
+    setRefreshing(true);
+    try {
+      const result = await getContractEvents({
+        contractId: contractId.trim(),
+        network,
+        type: eventType,
+        limit: effectiveLimit(),
+        ...(startLedger.trim() ? { startLedger: Number(startLedger) } : {}),
+      });
+
+      setEvents((prev) => dedupe(result.events, prev));
+      setLatestLedger(result.latestLedger);
+      if (!queryKey) {
+        setQueryKey(currentQueryKey);
+        setCursor(result.cursor);
+        setHasMore(result.events.length >= effectiveLimit());
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to refresh events');
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  // Clears the loaded events and pagination state without re-querying.
+  const reset = () => {
+    setEvents([]);
+    setCursor(null);
+    setHasMore(false);
+    setQueryKey('');
+    setError('');
+    setCursorError('');
+    setHasQueried(false);
+    setReplaySummary(null);
   };
 
   const addCriterion = () => {
@@ -580,16 +699,37 @@ export function ContractEventsTool() {
             />
           </label>
 
-          <div className="flex items-end sm:col-span-2">
+          <div className="flex items-end gap-2 sm:col-span-2">
             <button
               type="button"
               onClick={load}
               disabled={loading || !contractId.trim()}
-              className="flex w-full items-center justify-center gap-2 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-40"
+              className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-40"
             >
               <Search className="h-4 w-4" />
               {loading ? 'Loading…' : 'Fetch events'}
             </button>
+            {hasQueried && !loading && (
+              <>
+                <button
+                  type="button"
+                  onClick={refresh}
+                  disabled={refreshing || !contractId.trim()}
+                  title="Fetch from the latest ledger and merge new events"
+                  className="rounded-lg border border-border px-3 py-2 text-sm transition-colors hover:bg-muted/40 disabled:opacity-40"
+                >
+                  {refreshing ? 'Refreshing…' : 'Refresh'}
+                </button>
+                <button
+                  type="button"
+                  onClick={reset}
+                  title="Clear loaded events and pagination"
+                  className="rounded-lg border border-border px-3 py-2 text-sm transition-colors hover:bg-muted/40"
+                >
+                  Reset
+                </button>
+              </>
+            )}
           </div>
         </div>
 
@@ -760,6 +900,32 @@ export function ContractEventsTool() {
           {filtered.map((event) => (
             <EventCard key={event.id} event={event} copied={copied} copy={copy} />
           ))}
+
+          {cursorError ? (
+            <div className="flex flex-col items-center gap-2 rounded-lg border border-red-500/30 bg-red-500/5 p-4 text-center">
+              <p className="text-xs text-red-300">{cursorError}</p>
+              <button
+                type="button"
+                onClick={refresh}
+                className="rounded-lg border border-border px-3 py-1.5 text-xs transition-colors hover:bg-muted/40"
+              >
+                Reload from latest ledger
+              </button>
+            </div>
+          ) : hasMore ? (
+            <button
+              type="button"
+              onClick={loadOlder}
+              disabled={loadingMore}
+              className="w-full rounded-lg border border-border py-2 text-sm text-muted-foreground transition-colors hover:bg-muted/40 hover:text-foreground disabled:opacity-40"
+            >
+              {loadingMore ? 'Loading older events…' : 'Load older events'}
+            </button>
+          ) : (
+            <p className="py-2 text-center text-[11px] text-muted-foreground">
+              End of results — no more events for this query
+            </p>
+          )}
         </div>
       )}
 
