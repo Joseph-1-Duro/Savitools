@@ -4,7 +4,8 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
+import { assertPublicHostname } from '../webhook/ssrf-guard';
 import {
   rpc,
   Keypair,
@@ -19,6 +20,13 @@ import {
   StrKey,
   xdr,
 } from "@stellar/stellar-sdk";
+
+export const GIT_CLONE_TIMEOUT_MS = 30_000;
+export const WASM_URL_MAX_REDIRECTS = 5;
+export const WASM_URL_CACHE_TTL_MS = 10 * 60 * 1000;
+export const WASM_URL_CACHE_MAX_ENTRIES = 100;
+export const WASM_CONTENT_CACHE_MAX_ENTRIES = 100;
+export const DEFAULT_WASM_GIT_ALLOWED_HOSTS = ['github.com', 'gitlab.com'];
 
 export interface WasmMetadata {
   wasmId: string;
@@ -36,8 +44,10 @@ export class ContractsService {
   private readonly rpcServer: rpc.Server;
   private readonly deployer: Keypair;
   private readonly networkPassphrase: string;
+  private readonly isProduction: boolean;
+  private readonly allowedGitHosts: string[];
   private readonly wasmStore = new Map<string, { buffer: Buffer; metadata: WasmMetadata }>();
-  private readonly wasmUrlCache = new Map<string, string>();
+  private readonly wasmUrlCache = new Map<string, { contentHash: string; cachedAt: number }>();
   private readonly maxFileSize: number;
 
   constructor(
@@ -60,6 +70,13 @@ export class ContractsService {
         "Plaintext RPC (http) is not allowed for production signing",
       );
     }
+
+    this.isProduction = isProduction;
+
+    const configuredGitHosts = this.configService.get<string>('WASM_GIT_ALLOWED_HOSTS');
+    this.allowedGitHosts = configuredGitHosts
+      ? configuredGitHosts.split(',').map((host) => host.trim().toLowerCase()).filter((host) => host.length > 0)
+      : DEFAULT_WASM_GIT_ALLOWED_HOSTS;
 
     this.rpcServer = new rpc.Server(rpcUrl, { allowHttp: !isProduction });
 
@@ -123,36 +140,150 @@ export class ContractsService {
     };
 
     this.wasmStore.set(contentHash, { buffer: wasmBuffer, metadata });
+    this.pruneContentCache();
     this.logger.log(`Stored WASM ${wasmId} (${metadata.size} bytes, sha256: ${calculatedSha256})`);
 
     return metadata;
   }
 
-  async fetchWasmFromGit(gitRepoUrl: string, artifactPath: string): Promise<Buffer> {
-    // Validate gitRepoUrl against basic SSRF or safe protocols
-    if (!gitRepoUrl.startsWith('https://') && !gitRepoUrl.startsWith('git://') && !gitRepoUrl.startsWith('git@')) {
-      throw new BadRequestException('Invalid Git repository URL protocol');
+  private pruneContentCache(): void {
+    while (this.wasmStore.size > WASM_CONTENT_CACHE_MAX_ENTRIES) {
+      const oldest = this.wasmStore.keys().next().value;
+      if (oldest === undefined) break;
+      this.wasmStore.delete(oldest);
     }
+  }
+
+  private pruneUrlCache(): void {
+    const now = Date.now();
+    for (const [key, entry] of this.wasmUrlCache) {
+      if (now - entry.cachedAt >= WASM_URL_CACHE_TTL_MS) {
+        this.wasmUrlCache.delete(key);
+      }
+    }
+    while (this.wasmUrlCache.size > WASM_URL_CACHE_MAX_ENTRIES) {
+      const oldest = this.wasmUrlCache.keys().next().value;
+      if (oldest === undefined) break;
+      this.wasmUrlCache.delete(oldest);
+    }
+  }
+
+  private async assertSafeWasmUrl(
+    parsedUrl: URL,
+  ): Promise<void> {
+    const allowHttp = !this.isProduction;
+    if (parsedUrl.protocol !== 'https:' && !(allowHttp && parsedUrl.protocol === 'http:')) {
+      throw new BadRequestException(`Unsupported WASM URL protocol: ${parsedUrl.protocol}`);
+    }
+    await assertPublicHostname(parsedUrl.hostname);
+  }
+
+  private async assertSafeGitRepoUrl(gitRepoUrl: string): Promise<string> {
+    // Reject scp-like remote syntax (`git@host:repo`) before anything else.
+    if (gitRepoUrl.startsWith('git@')) {
+      throw new BadRequestException('Unsupported Git remote syntax: git@ remotes are not allowed');
+    }
+
+    let parsed: URL;
+    try {
+      parsed = new URL(gitRepoUrl);
+    } catch {
+      throw new BadRequestException('Invalid Git repository URL');
+    }
+
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'git:') {
+      throw new BadRequestException(
+        `Unsupported Git repository URL protocol: ${parsed.protocol}`,
+      );
+    }
+
+    if (!parsed.hostname) {
+      throw new BadRequestException('Git repository URL is missing a host');
+    }
+
+    const host = parsed.hostname.toLowerCase();
+    if (!this.allowedGitHosts.includes(host)) {
+      throw new BadRequestException(`Git host ${host} is not allowlisted for WASM import`);
+    }
+
+    await assertPublicHostname(parsed.hostname);
+
+    return parsed.toString();
+  }
+
+  private assertArtifactPathInsideCheckout(artifactPath: string): string {
+    if (!artifactPath || artifactPath.trim().length === 0) {
+      throw new BadRequestException('WASM artifact path is required');
+    }
+
+    if (path.isAbsolute(artifactPath) || artifactPath.startsWith('\\') || /^[a-zA-Z]:/.test(artifactPath)) {
+      throw new BadRequestException('WASM artifact path must be relative');
+    }
+
+    const normalized = path.normalize(artifactPath);
+    if (normalized === '..' || normalized.startsWith(`..${path.sep}`)) {
+      throw new BadRequestException('WASM artifact path escapes the checkout directory');
+    }
+
+    return normalized;
+  }
+
+  private resolveArtifactInsideCheckout(tempDir: string, normalizedArtifactPath: string): string {
+    const checkoutRoot = path.resolve(tempDir);
+    const resolved = path.resolve(checkoutRoot, normalizedArtifactPath);
+    const relative = path.relative(checkoutRoot, resolved);
+
+    if (relative.startsWith('..') || path.isAbsolute(relative)) {
+      throw new BadRequestException('WASM artifact path escapes the temporary checkout directory');
+    }
+
+    if (!fs.existsSync(resolved)) {
+      throw new NotFoundException(
+        `WASM artifact not found at path ${normalizedArtifactPath} in repository`,
+      );
+    }
+
+    // Symlinks are rejected so a hostile repository cannot point the artifact
+    // outside of the temporary checkout root.
+    const stat = fs.lstatSync(resolved);
+    if (!stat.isFile()) {
+      throw new BadRequestException('WASM artifact is not a regular file');
+    }
+
+    return resolved;
+  }
+
+  async fetchWasmFromGit(gitRepoUrl: string, artifactPath: string): Promise<Buffer> {
+    const repoUrl = await this.assertSafeGitRepoUrl(gitRepoUrl);
+    const normalizedArtifactPath = this.assertArtifactPathInsideCheckout(artifactPath);
 
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'savitools-git-'));
     try {
-      this.logger.log(`Cloning read-only Git repo ${gitRepoUrl} into ${tempDir}...`);
-      execSync(`git clone --depth 1 --no-checkout ${JSON.stringify(gitRepoUrl)} .`, {
+      this.logger.log(`Cloning read-only Git repo ${repoUrl} into ${tempDir}...`);
+      // Argument-array invocation: no shell, so command metacharacters in the
+      // attacker-controlled URL or artifact path are never interpreted.
+      execFileSync('git', ['clone', '--depth', '1', '--no-checkout', repoUrl, '.'], {
         cwd: tempDir,
-        timeout: 30000,
+        timeout: GIT_CLONE_TIMEOUT_MS,
+        stdio: 'ignore',
+      });
+      execFileSync('git', ['sparse-checkout', 'init', '--cone'], {
+        cwd: tempDir,
+        timeout: GIT_CLONE_TIMEOUT_MS,
+        stdio: 'ignore',
+      });
+      execFileSync('git', ['sparse-checkout', 'set', normalizedArtifactPath], {
+        cwd: tempDir,
+        timeout: GIT_CLONE_TIMEOUT_MS,
+        stdio: 'ignore',
+      });
+      execFileSync('git', ['checkout'], {
+        cwd: tempDir,
+        timeout: GIT_CLONE_TIMEOUT_MS,
         stdio: 'ignore',
       });
 
-      // Sparse checkout artifact path
-      execSync(`git sparse-checkout init --cone`, { cwd: tempDir, stdio: 'ignore' });
-      execSync(`git sparse-checkout set ${JSON.stringify(artifactPath)}`, { cwd: tempDir, stdio: 'ignore' });
-      execSync(`git checkout`, { cwd: tempDir, stdio: 'ignore' });
-
-      const fullArtifactPath = path.join(tempDir, artifactPath);
-      if (!fs.existsSync(fullArtifactPath)) {
-        throw new NotFoundException(`WASM artifact not found at path ${artifactPath} in repository`);
-      }
-
+      const fullArtifactPath = this.resolveArtifactInsideCheckout(tempDir, normalizedArtifactPath);
       return fs.readFileSync(fullArtifactPath);
     } catch (err: any) {
       if (err instanceof NotFoundException || err instanceof BadRequestException) throw err;
@@ -165,13 +296,20 @@ export class ContractsService {
   }
 
   async fetchWasmFromUrl(url: string): Promise<{ buffer: Buffer; metadata: WasmMetadata }> {
-    const normalizedUrl = this.resolveWasmUrl(url);
-    const cachedHash = this.wasmUrlCache.get(normalizedUrl);
+    const resolvedUrl = this.resolveWasmUrl(url);
+    this.pruneUrlCache();
 
-    if (cachedHash && this.wasmStore.has(cachedHash)) {
-      const cached = this.wasmStore.get(cachedHash)!;
-      return { buffer: cached.buffer, metadata: cached.metadata };
+    const cachedEntry = this.wasmUrlCache.get(resolvedUrl);
+    if (cachedEntry) {
+      const cached = this.wasmStore.get(cachedEntry.contentHash);
+      if (cached && Date.now() - cachedEntry.cachedAt < WASM_URL_CACHE_TTL_MS) {
+        return { buffer: cached.buffer, metadata: cached.metadata };
+      }
+      this.wasmUrlCache.delete(resolvedUrl);
     }
+
+    const initialUrl = new URL(resolvedUrl);
+    await this.assertSafeWasmUrl(initialUrl);
 
     const configuredTimeout = this.configService.get<string>('WASM_URL_TIMEOUT_MS');
     const timeoutMs = configuredTimeout ? parseInt(configuredTimeout, 10) || 30000 : 30000;
@@ -179,10 +317,29 @@ export class ContractsService {
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
-      const response = await fetch(normalizedUrl, {
-        signal: controller.signal,
-        redirect: 'follow',
-      });
+      let currentUrl = initialUrl;
+      let redirects = 0;
+      let response: Response;
+
+      for (;;) {
+        response = await fetch(currentUrl, {
+          signal: controller.signal,
+          redirect: 'manual',
+        });
+
+        if (response.status >= 300 && response.status < 400) {
+          const location = response.headers.get('location');
+          if (!location || redirects >= WASM_URL_MAX_REDIRECTS) {
+            break;
+          }
+          redirects += 1;
+          void response.body?.cancel().catch(() => undefined);
+          currentUrl = new URL(location, currentUrl);
+          await this.assertSafeWasmUrl(currentUrl);
+          continue;
+        }
+        break;
+      }
 
       if (!response.ok) {
         throw new BadRequestException(
@@ -201,6 +358,8 @@ export class ContractsService {
         throw new BadRequestException('Failed to download WASM from URL: empty response body');
       }
 
+      // response.body is the (auto-)decompressed stream, so the size limit is
+      // enforced after decompression and across every redirect hop.
       const chunks: Buffer[] = [];
       let totalSize = 0;
 
@@ -225,14 +384,14 @@ export class ContractsService {
         throw new BadRequestException('Invalid WASM format');
       }
 
-      const contentHash = hash(wasmBuffer).toString('hex');
       const metadata = await this.storeUploadedWasm({
         wasmBuffer,
-        filename: path.basename(new URL(normalizedUrl).pathname) || 'contract.wasm',
+        filename: path.basename(new URL(resolvedUrl).pathname) || 'contract.wasm',
         source: 'url',
       });
 
-      this.wasmUrlCache.set(normalizedUrl, contentHash);
+      this.wasmUrlCache.set(resolvedUrl, { contentHash: metadata.contentHash, cachedAt: Date.now() });
+      this.pruneUrlCache();
 
       return { buffer: wasmBuffer, metadata };
     } catch (err: any) {

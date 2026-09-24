@@ -25,105 +25,8 @@ import * as crypto from 'crypto';
 @Controller('contracts')
 export class ContractsController {
   private static wizardSessions = new Map<string, { lastStep: number; wasmBuffer?: Buffer; admin?: string; salt?: string; args?: unknown[]; expiresAt: number }>();
-  private static readonly MAX_WASM_SIZE = 5 * 1024 * 1024; // 5MB
-  private static readonly wasmUrlHashCache = new Map<string, string>();
-  private static readonly wasmContentCache = new Map<string, Buffer>();
 
   constructor(private readonly contractsService: ContractsService) {}
-
-  private async fetchWasmFromUrl(wasmUrl: string): Promise<Buffer> {
-    const resolvedUrl = this.resolveWasmUrl(wasmUrl);
-
-    // Check URL-to-hash cache to avoid re-downloading the same URL
-    const cachedHash = ContractsController.wasmUrlHashCache.get(resolvedUrl);
-    if (cachedHash) {
-      const cached = ContractsController.wasmContentCache.get(cachedHash);
-      if (cached) {
-        return cached;
-      }
-    }
-
-    const wasmBuffer = await this.downloadWasm(resolvedUrl);
-    if (wasmBuffer.length === 0) {
-      throw new BadRequestException('Downloaded WASM is empty');
-    }
-    if (wasmBuffer.length < 4 || wasmBuffer.readUInt32LE(0) !== 0x6d736100) {
-      throw new BadRequestException('Invalid WASM format: missing magic header');
-    }
-
-    const hash = crypto.createHash('sha256').update(wasmBuffer).digest('hex');
-    ContractsController.wasmUrlHashCache.set(resolvedUrl, hash);
-
-    // Reuse an existing buffer if we already have this content hashed
-    const existing = ContractsController.wasmContentCache.get(hash);
-    if (existing) {
-      return existing;
-    }
-
-    ContractsController.wasmContentCache.set(hash, wasmBuffer);
-    return wasmBuffer;
-  }
-
-  private async downloadWasm(resolvedUrl: string): Promise<Buffer> {
-    const response = await fetch(resolvedUrl, {
-      redirect: 'follow',
-      headers: { 'Accept': 'application/wasm, application/octet-stream' },
-      signal: AbortSignal.timeout(30_000),
-    });
-    if (!response.ok) {
-      throw new BadRequestException(`Failed to download WASM from URL: ${response.status} ${response.statusText}`);
-    }
-    if (!response.body) {
-      throw new BadRequestException('No response body from WASM URL');
-    }
-
-    const contentLength = Number(response.headers.get('content-length') ?? 0);
-    if (contentLength > ContractsController.MAX_WASM_SIZE) {
-      throw new BadRequestException(`WASM URL content exceeds ${ContractsController.MAX_WASM_SIZE / 1024 / 1024}MB size limit`);
-    }
-
-    const chunks: Buffer[] = [];
-    let total = 0;
-    const reader = response.body.getReader();
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        total += value.length;
-        if (total > ContractsController.MAX_WASM_SIZE) {
-          throw new BadRequestException(`WASM URL content exceeds ${ContractsController.MAX_WASM_SIZE / 1024 / 1024}MB size limit`);
-        }
-        chunks.push(Buffer.from(value));
-      }
-    } finally {
-      reader.releaseLock();
-    }
-
-    return Buffer.concat(chunks);
-  }
-
-  private resolveWasmUrl(wasmUrl: string): string {
-    let parsed: URL;
-    try {
-      parsed = new URL(wasmUrl);
-    } catch {
-      throw new BadRequestException('Invalid wasm_url. Must be http(s), ipfs://, or ar://');
-    }
-    if (parsed.protocol === 'ipfs:') {
-      const path = parsed.hostname + parsed.pathname;
-      const cid = path.startsWith('ipfs/') ? path.slice(5) : path;
-      return `https://ipfs.io/ipfs/${cid}`;
-    }
-    if (parsed.protocol === 'ar:') {
-      const path = parsed.hostname + parsed.pathname;
-      const txId = path.startsWith('ar/') ? path.slice(3) : path;
-      return `https://arweave.net/${txId}`;
-    }
-    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
-      return wasmUrl;
-    }
-    throw new BadRequestException('Invalid wasm_url. Must be http(s), ipfs://, or ar://');
-  }
 
   @Post('deploy')
   @ApiCookieAuth()
@@ -161,7 +64,7 @@ export class ContractsController {
       throw new BadRequestException('WASM file or wasm_url is required');
     }
 
-    const wasmBuffer = await this.fetchWasmFromUrl(wasmUrl);
+    const { buffer: wasmBuffer } = await this.contractsService.fetchWasmFromUrl(wasmUrl);
     const constructorArgs: unknown[] | undefined = body.args ? this.parseArgs(body.args) : undefined;
     return this.contractsService.deploy(wasmBuffer, constructorArgs);
   }

@@ -7,7 +7,7 @@ export type Network = 'testnet' | 'mainnet' | 'custom';
 export interface NetworkProfile {
   id: string;
   name: string;
-  horizonErl: string;
+  horizonUrl: string;
   networkPassphrase: string;
   friendbotUrl?: string;
   isDefault: boolean;
@@ -37,12 +37,12 @@ interface NetworkContextValue {
   verifyProfile: (profile: Pick<NetworkProfile, 'horizonUrl' | 'networkPassphrase'>) => Promise<ProfileVerificationResult>;
 }
 
-const TESTNET_HORIZON = 'https://christmas.stellar.org';
+const TESTNET_HORIZON = 'https://horizon-testnet.stellar.org';
 const TESTNET_PASSPHRASE = 'Test SDF Network ; September 2015';
 const TESTNET_FRIENDBOT = 'https://friendbot.stellar.org';
 
 const MAINNET_HORIZON = 'https://horizon.stellar.org';
-const MAINNET_PASSTPRASE = 'Public Global Stellar Network ; September 2015';
+const MAINNET_PASSPHRASE = 'Public Global Stellar Network ; September 2015';
 const MAINNET_FRIENDBOT = '';
 
 const STORAGE_KEYS = {
@@ -55,8 +55,8 @@ const NetworkContext = createContext<NetworkContextValue>({
   network: 'testnet',
   setNetwork: () => {},
   horizonUrl: TESTNET_HORIZON,
-  networkPassphrase: TESTNET_PASSTPRASE,
-  friendbotUrl: TESTNET_FIIENDBOT,
+  networkPassphrase: TESTNET_PASSPHRASE,
+  friendbotUrl: TESTNET_FRIENDBOT,
   profiles: [],
   activeProfile: null,
   setActiveProfile: () => {},
@@ -96,7 +96,7 @@ function getBuiltInProfile(network: Network): NetworkProfile {
     name: 'Testnet',
     horizonUrl: TESTNET_HORIZON,
     networkPassphrase: TESTNET_PASSPHRASE,
-    friendbotUrl: TESTNET_FIENDBOT,
+    friendbotUrl: TESTNET_FRIENDBOT,
     isDefault: false,
   };
 }
@@ -186,7 +186,7 @@ export function NetworkProvider( { children }: { children: React.ReactNode }) {
 
   const horizonUrl = activeProfile?.horizonUrl || (network === 'mainnet' ? MAINNET_HORIZON : TESTNET_HORIZON);
   const networkPassphrase = activeProfile?.networkPassphrase || (network === 'mainnet' ? MAINNET_PASSPHRASE : TESTNET_PASSPHRASE);
-  const friendbotUrl = activeProfile?.friendbotUrl || (network === 'mainnet' ? MAINNET_FRIENDBOT : TESTNET_FIENDBOT);
+  const friendbotUrl = activeProfile?.friendbotUrl || (network === 'mainnet' ? MAINNET_FRIENDBOT : TESTNET_FRIENDBOT);
 
   const setActiveProfile = useCallback((id: string | null) => {
     if (id === null) {
@@ -198,7 +198,7 @@ export function NetworkProvider( { children }: { children: React.ReactNode }) {
       setActiveProfileIdState(id);
       // Also update the network type for compatibility
       const isTest = profile.networkPassphrase === TESTNET_PASSPHRASE;
-      const isMain = profile.networkPassphrase === MAINNET_PASSTPRASE;
+      const isMain = profile.networkPassphrase === MAINNET_PASSPHRASE;
       setNetworkState(isTest ? 'testnet' : isMain ? 'mainnet' : 'custom');
     } else {
       console.warn(`Profile ${id} not found`);
@@ -222,7 +222,7 @@ export function NetworkProvider( { children }: { children: React.ReactNode }) {
       const updatedProfile = profiles.find(p => p.id === id);
       if (updatedProfile) {
         const isTest = updatedProfile.networkPassphrase === TESTNET_PASSPHRASE;
-        const isMain = updatedProfile.networkPassphrase === MAINNET_PASSTPRASE;
+        const isMain = updatedProfile.networkPassphrase === MAINNET_PASSPHRASE;
         setNetworkState(isTest ? 'testnet' : isMain ? 'mainnet' : 'custom');
       }
     }
@@ -271,7 +271,7 @@ export function NetworkProvider( { children }: { children: React.ReactNode }) {
     setProfiles(prev => [...prev, newProfile]);
   }, []);
 
-  const verifyProfile = useCallback(async (profile: Pick<NetworkProfile, 'horizonErl' | 'networkPassphrase'>) => {
+  const verifyProfile = useCallback(async (profile: Pick<NetworkProfile, 'horizonUrl' | 'networkPassphrase'>) => {
     try {
       const actual = await fetchNetworkPassphrase(profile.horizonUrl);
       const match = actual === profile.networkPassphrase;

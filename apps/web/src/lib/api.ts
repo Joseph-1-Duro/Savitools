@@ -43,12 +43,12 @@ export async function apiFetch<T>(
   return parseJson<T>(response);
 }
 
-/**
+export async function downloadCsv(path: string, filename: string): Promise<void> {
+  /**
  * Shared download helper: fetches an authenticated endpoint that responds
  * with a file attachment and triggers a browser download. Used by the monitor
  * CSV export and the inspector transaction export (see Savitura/Savitools#195).
  */
-export async function downloadCsv(path: string, filename: string): Promise<void> {
   const response = await fetch(`${API_URL}/v1${path}`, {
     credentials: "include",
   });
@@ -124,7 +124,7 @@ export async function getCurrentUser() {
 export async function connectFluxa(apiKey: string) {
   return apiFetch<{ user: AuthUser }>("/auth/fluxa", {
     method: "POST",
-    body: JSON.stringify({ apiKey }),
+    body: JSON.stringify({ apiKey, confirmLink: true }),
   });
 }
 
