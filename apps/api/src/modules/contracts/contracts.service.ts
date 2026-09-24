@@ -6,6 +6,8 @@ import * as path from 'path';
 import * as os from 'os';
 import { execFileSync } from 'child_process';
 import { assertPublicHostname } from '../webhook/ssrf-guard';
+import { AbiCatalogEntry, buildAbiCatalog, encodeAbiArgument } from './abi-catalog';
+import { AttachAbiDto, ABI_MAX_BYTES } from './dto/attach-abi.dto';
 import {
   rpc,
   Keypair,
@@ -38,6 +40,10 @@ export interface WasmMetadata {
   source: 'file' | 'git' | 'url';
 }
 
+/** Attached-ABI catalog bounds — mirrors the wizard session TTL pattern. */
+export const ABI_CATALOG_MAX_ENTRIES = 200;
+export const ABI_CATALOG_TTL_MS = 60 * 60 * 1000; // 1 hour
+
 @Injectable()
 export class ContractsService {
   private readonly logger = new Logger(ContractsService.name);
@@ -49,6 +55,7 @@ export class ContractsService {
   private readonly wasmStore = new Map<string, { buffer: Buffer; metadata: WasmMetadata }>();
   private readonly wasmUrlCache = new Map<string, { contentHash: string; cachedAt: number }>();
   private readonly maxFileSize: number;
+  private readonly abiCatalogs = new Map<string, { entry: AbiCatalogEntry; expiresAt: number }>();
 
   constructor(
     private readonly configService: ConfigService,
@@ -791,5 +798,94 @@ export class ContractsService {
       wasmHash: wasmHashHex,
       network: this.configService.get<string>("STELLAR_NETWORK", "testnet"),
     };
+  }
+
+  // ─── Contract ABI catalog (Savitura/Savitools#219) ───────────────────────
+
+  /**
+   * Attach a validated ABI/interface document to a contract (and optionally a
+   * WASM record). Storage is an in-process bounded registry — no new
+   * migration is introduced (Savitura/Savitools#194 dependency).
+   */
+  attachAbi(contractId: string, dto: AttachAbiDto): AbiCatalogEntry {
+    if (!contractId || contractId.length < 40) {
+      throw new BadRequestException('contractId must be a Soroban contract ID');
+    }
+
+    if (Buffer.byteLength(JSON.stringify(dto.schema ?? {}), 'utf8') > ABI_MAX_BYTES) {
+      throw new BadRequestException(
+        `ABI document exceeds the maximum accepted size of ${ABI_MAX_BYTES} bytes`,
+      );
+    }
+
+    const entry = buildAbiCatalog(contractId, dto.schema, {
+      wasmId: dto.wasmId,
+      network: dto.network ?? 'testnet',
+      name: dto.name,
+    });
+
+    this.pruneAbiCatalogs();
+    this.abiCatalogs.set(entry.id, {
+      entry,
+      expiresAt: Date.now() + ABI_CATALOG_TTL_MS,
+    });
+
+    return entry;
+  }
+
+  getAbi(contractId: string, wasmId?: string): AbiCatalogEntry {
+    const id = `${contractId}:${wasmId ?? 'default'}`;
+    const found = this.abiCatalogs.get(id);
+    if (!found || found.expiresAt < Date.now()) {
+      this.abiCatalogs.delete(id);
+      throw new NotFoundException(
+        `No ABI catalog attached to contract ${contractId}` +
+          (wasmId ? ` / WASM ${wasmId}` : ''),
+      );
+    }
+    return found.entry;
+  }
+
+  /** Encode declared arguments using the existing SCVal utilities. */
+  encodeAbiArguments(
+    contractId: string,
+    functionName: string,
+    args: unknown[],
+    wasmId?: string,
+  ): Array<{ name: string; type: string; xdrBase64: string; decoded: { type: string; value: unknown } }> {
+    const entry = this.getAbi(contractId, wasmId);
+    const method = entry.methods.find((m) => m.name === functionName);
+    if (!method) {
+      throw new NotFoundException(
+        `Method '${functionName}' is not part of the ABI catalog for ${contractId}`,
+      );
+    }
+    if (args.length !== method.arguments.length) {
+      throw new BadRequestException(
+        `Method '${functionName}' expects ${method.arguments.length} argument(s), received ${args.length}`,
+      );
+    }
+
+    return method.arguments.map((arg, i) => {
+      const encoded = encodeAbiArgument(arg.type, args[i]);
+      return {
+        name: arg.name,
+        type: arg.type,
+        xdrBase64: encoded.xdrBase64,
+        decoded: encoded.decoded,
+      };
+    });
+  }
+
+  private pruneAbiCatalogs(): void {
+    const now = Date.now();
+    for (const [key, entry] of this.abiCatalogs) {
+      if (entry.expiresAt < now) this.abiCatalogs.delete(key);
+    }
+    while (this.abiCatalogs.size > ABI_CATALOG_MAX_ENTRIES) {
+      const oldest = this.abiCatalogs.keys().next().value;
+      if (oldest === undefined) break;
+      this.abiCatalogs.delete(oldest);
+    }
   }
 }

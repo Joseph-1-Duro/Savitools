@@ -5,6 +5,7 @@ import {
   Param,
   Body,
   Req,
+  Query,
   BadRequestException,
   UnprocessableEntityException,
   UseGuards,
@@ -17,6 +18,7 @@ import { ContractsService } from './contracts.service';
 import { InvokeContractDto } from './dto/invoke-contract.dto';
 import { DeployContractDto } from './dto/deploy-contract.dto';
 import { DeployWizardDto } from './dto/wizard.dto';
+import { AttachAbiDto } from './dto/attach-abi.dto';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { ContractAuthorizationGuard } from './guards/contract-authorization.guard';
 import * as crypto from 'crypto';
@@ -268,6 +270,58 @@ export class ContractsController {
     @Body() dto: InvokeContractDto,
   ) {
     return this.contractsService.invoke(contractId, dto.functionName, dto.args);
+  }
+
+  @Post(':contractId/abi')
+  @ApiCookieAuth()
+  @UseGuards(JwtAuthGuard, ContractAuthorizationGuard)
+  @ApiOperation({
+    summary: 'Attach a validated contract ABI/interface document to a contract or WASM record',
+  })
+  @ApiParam({ name: 'contractId', description: 'Contract ID' })
+  @ApiResponse({ status: 200, description: 'ABI attached and validated' })
+  @ApiResponse({ status: 400, description: 'Invalid ABI document or identifier' })
+  @ApiResponse({ status: 422, description: 'Field-level ABI validation errors' })
+  async attachAbi(
+    @Param('contractId') contractId: string,
+    @Body() dto: AttachAbiDto,
+  ) {
+    return this.contractsService.attachAbi(contractId, dto);
+  }
+
+  @Get(':contractId/abi')
+  @ApiOperation({
+    summary: 'Browse the methods, argument types, return types, and events of an attached ABI',
+  })
+  @ApiParam({ name: 'contractId', description: 'Contract ID' })
+  @ApiResponse({ status: 200, description: 'ABI catalog retrieved' })
+  @ApiResponse({ status: 404, description: 'No ABI attached' })
+  getAbi(
+    @Param('contractId') contractId: string,
+    @Query('wasmId') wasmId?: string,
+  ) {
+    return this.contractsService.getAbi(contractId, wasmId);
+  }
+
+  @Post(':contractId/abi/:functionName/encode')
+  @ApiCookieAuth()
+  @UseGuards(JwtAuthGuard, ContractAuthorizationGuard)
+  @ApiOperation({
+    summary: 'Encode invocation arguments for an ABI method using existing SCVal precision',
+  })
+  @ApiParam({ name: 'contractId', description: 'Contract ID' })
+  @ApiParam({ name: 'functionName', description: 'ABI method name' })
+  async encodeAbiArguments(
+    @Param('contractId') contractId: string,
+    @Param('functionName') functionName: string,
+    @Body() dto: { args?: unknown[]; wasmId?: string },
+  ) {
+    return this.contractsService.encodeAbiArguments(
+      contractId,
+      functionName,
+      Array.isArray(dto?.args) ? dto.args : [],
+      dto?.wasmId,
+    );
   }
 
   @Get(':contractId/info')

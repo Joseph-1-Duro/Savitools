@@ -292,6 +292,71 @@ export async function getContractInfo(contractId: string) {
   return apiFetch<ContractInfo>(`/contracts/${contractId}/info`);
 }
 
+export interface AbiMethodArg {
+  name: string;
+  type: string;
+}
+
+export interface AbiMethod {
+  name: string;
+  arguments: AbiMethodArg[];
+  returnType: string;
+}
+
+export interface AbiEventTopic {
+  name: string;
+  indexed: boolean;
+}
+
+export interface AbiEvent {
+  name: string;
+  arguments: AbiMethodArg[];
+  topics: AbiEventTopic[];
+}
+
+export interface AbiCatalogEntry {
+  id: string;
+  contractId: string;
+  wasmId?: string;
+  network: string;
+  name?: string;
+  methods: AbiMethod[];
+  events: AbiEvent[];
+  attachedAt: string;
+}
+
+export async function attachContractAbi(
+  contractId: string,
+  schema: unknown,
+  options?: { wasmId?: string; network?: "testnet" | "mainnet"; name?: string },
+) {
+  return apiFetch<AbiCatalogEntry>(`/contracts/${contractId}/abi`, {
+    method: "POST",
+    body: JSON.stringify({ schema, ...options }),
+  });
+}
+
+export async function getContractAbi(
+  contractId: string,
+  wasmId?: string,
+) {
+  const query = wasmId ? `?wasmId=${encodeURIComponent(wasmId)}` : "";
+  return apiFetch<AbiCatalogEntry>(`/contracts/${contractId}/abi${query}`);
+}
+
+export async function encodeContractAbiArguments(
+  contractId: string,
+  functionName: string,
+  args: unknown[],
+) {
+  return apiFetch<
+    Array<{ name: string; type: string; xdrBase64: string; decoded: { type: string; value: unknown } }>
+  >(`/contracts/${contractId}/abi/${encodeURIComponent(functionName)}/encode`, {
+    method: "POST",
+    body: JSON.stringify({ args }),
+  });
+}
+
 /* ─── Playground ─────────────────────────────────────────────────────────── */
 
 export type PlaygroundProvider = "fluxa" | "crowdpay";
