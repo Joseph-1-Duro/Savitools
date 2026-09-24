@@ -39,7 +39,7 @@
     "resend": "^6.17.2",
     "rxjs": "^7.8.1",
     "socket.io": "^4.7.0",
-    "toml": "^3.0.0",
+    "smol-toml": "^1.9.0",
     "typeorm": "^0.3.20"
   },
   "devDependencies": {

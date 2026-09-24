@@ -4,11 +4,20 @@ import {
   Logger,
   NotFoundException,
   BadGatewayException,
+  PayloadTooLargeException,
 } from '@nestjs/common';
-import * as toml from 'toml';
+import * as smolToml from 'smol-toml';
 import { assertPublicHostname, MAX_PROXY_REDIRECTS } from '../playground/ssrf-guard';
 
 const FETCH_TIMEOUT = 15_000;
+
+// ─── TOML input bounds (Savitura/Savitools#220) ──────────────────────────────
+/** Maximum stellar.toml response size accepted before parsing. */
+export const TOML_MAX_BYTES = 512 * 1024;
+/** Maximum nesting depth of the parsed document. */
+export const TOML_MAX_DEPTH = 64;
+/** Hard cap on keys produced by a single document. */
+export const TOML_MAX_KEYS = 10_000;
 
 function isPublicKey(input: string): boolean {
   return /^G[A-Z2-7]{55}$/.test(input);
@@ -104,6 +113,69 @@ export interface SepResult {
 }
 
 const REQUIRED_TOML_FIELDS = ['ACCOUNTS'] as const;
+
+/**
+ * Bounded TOML parsing for remote stellar.toml content (Savitura/Savitools#220).
+ *
+ * smol-toml is a maintained parser without prototype-pollution or
+ * uncontrolled-recursion behavior; the guards here cap input size, nesting
+ * depth, and allocation before any parsed data is returned.
+ */
+function measureDepth(value: unknown, depth = 0): number {
+  if (depth > TOML_MAX_DEPTH) return depth;
+  if (Array.isArray(value)) {
+    let max = depth;
+    for (const item of value) max = Math.max(max, measureDepth(item, depth + 1));
+    return max;
+  }
+  if (value && typeof value === 'object') {
+    let max = depth;
+    for (const item of Object.values(value)) max = Math.max(max, measureDepth(item, depth + 1));
+    return max;
+  }
+  return depth;
+}
+
+function countKeys(value: unknown): number {
+  if (!value || typeof value !== 'object') return 0;
+  if (Array.isArray(value)) {
+    return value.reduce<number>((sum, item) => sum + countKeys(item), 0);
+  }
+  let count = 0;
+  for (const item of Object.values(value)) count += 1 + countKeys(item);
+  return count;
+}
+
+function parseBoundedToml(raw: string): Record<string, unknown> {
+  if (Buffer.byteLength(raw, 'utf8') > TOML_MAX_BYTES) {
+    throw new PayloadTooLargeException(
+      `stellar.toml exceeds the maximum accepted size of ${TOML_MAX_BYTES} bytes`,
+    );
+  }
+
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = smolToml.parse(raw) as Record<string, unknown>;
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : 'Unknown parse error';
+    throw new BadRequestException(`Malformed TOML document: ${msg}`);
+  }
+
+  const depth = measureDepth(parsed);
+  if (depth >= TOML_MAX_DEPTH) {
+    throw new BadRequestException(
+      `TOML document nesting depth exceeds the limit of ${TOML_MAX_DEPTH}`,
+    );
+  }
+
+  if (countKeys(parsed) > TOML_MAX_KEYS) {
+    throw new BadRequestException(
+      `TOML document exceeds the maximum of ${TOML_MAX_KEYS} keys`,
+    );
+  }
+
+  return parsed;
+}
 
 @Injectable()
 export class FederationService {
@@ -281,8 +353,14 @@ export class FederationService {
 
     let parsed: Record<string, unknown>;
     try {
-      parsed = toml.parse(rawToml) as Record<string, unknown>;
+      parsed = parseBoundedToml(rawToml);
     } catch (err: unknown) {
+      if (
+        err instanceof BadRequestException ||
+        err instanceof PayloadTooLargeException
+      ) {
+        throw err;
+      }
       const msg = err instanceof Error ? err.message : 'Unknown parse error';
       throw new BadRequestException(
         `Failed to parse stellar.toml for ${cleanDomain}: ${msg}`,
@@ -579,7 +657,7 @@ export class FederationService {
       );
     }
     const raw = await res.text();
-    return toml.parse(raw) as Record<string, unknown>;
+    return parseBoundedToml(raw);
   }
 
   private async probeEndpoint(

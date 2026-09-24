@@ -1,5 +1,9 @@
-import { BadRequestException, NotFoundException } from '@nestjs/common';
-import { FederationService } from './federation.service';
+import {
+  BadRequestException,
+  NotFoundException,
+  PayloadTooLargeException,
+} from '@nestjs/common';
+import { FederationService, TOML_MAX_BYTES } from './federation.service';
 
 const VALID_KEY =
   'GDJ47UQJNT6UOMV3CLNZ43XGDKOUM3UHV7V3FF3W4KMIRRNICNSS2N2H';
@@ -287,6 +291,80 @@ describe('FederationService', () => {
       const result = await service.getToml('comments.com');
       expect(result.version).toBe('1.0.0');
       expect(result.validationWarnings).toEqual([]);
+    });
+
+    // ── Regression tests for the bounded parser (Savitura/Savitools#220) ──
+
+    it('rejects oversized stellar.toml with a controlled 413', async () => {
+      mockFetch({
+        'huge.com/.well-known/stellar.toml': {
+          ok: true,
+          text: 'A="' + 'x'.repeat(TOML_MAX_BYTES + 1) + '"',
+        },
+      });
+
+      await expect(service.getToml('huge.com')).rejects.toThrow(
+        PayloadTooLargeException,
+      );
+    });
+
+    it('rejects deeply nested TOML with a controlled 400', async () => {
+      const depth = 100;
+      // Chain inline tables: a.b.c... each [bracket] adds one nesting level.
+      let line = 'value = 1';
+      for (let i = 0; i < depth; i++) {
+        line = `table_${i} = { ${line} }`;
+      }
+
+      mockFetch({
+        'deep.com/.well-known/stellar.toml': {
+          ok: true,
+          text: line,
+        },
+      });
+
+      await expect(service.getToml('deep.com')).rejects.toThrow(
+        BadRequestException,
+      );
+      await expect(service.getToml('deep.com')).rejects.toThrow(
+        /nesting depth/i,
+      );
+    });
+
+    it('cannot pollute Object.prototype via a pollution payload', async () => {
+      const pollution = '[[CURRENCIES]]\nCODE="USDC"\nISSUER="GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"\n__proto__ = { "polluted": true }\n';
+
+      mockFetch({
+        'evil.com/.well-known/stellar.toml': {
+          ok: true,
+          text: pollution,
+        },
+      });
+
+      await service.getToml('evil.com');
+
+      expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+      expect(
+        (Object.prototype as unknown as Record<string, unknown>).polluted,
+      ).toBeUndefined();
+    });
+
+    it('rejects malformed TOML with a controlled 400', async () => {
+      mockFetch({
+        'broken.com/.well-known/stellar.toml': {
+          ok: true,
+          text: 'key = [unclosed',
+        },
+      });
+
+      await expect(service.getToml('broken.com')).rejects.toThrow(
+        BadRequestException,
+      );
+    });
+
+    it('keeps SSRF validation active around the fetch', async () => {
+      await expect(service.getToml('169.254.169.254')).rejects.toThrow();
+      expect(global.fetch).not.toHaveBeenCalled();
     });
   });
 
