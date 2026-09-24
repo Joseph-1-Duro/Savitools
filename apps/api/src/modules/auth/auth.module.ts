@@ -6,6 +6,7 @@ import { createClient } from 'redis';
 import { AuthController } from './auth.controller';
 import { AuthService } from './auth.service';
 import { ConnectedAccount } from './entities/connected-account.entity';
+import { PasskeyCredential } from './entities/passkey.entity';
 import { RefreshToken } from './entities/refresh-token.entity';
 import { User } from './entities/user.entity';
 import { VaultKey } from './entities/vault-key.entity';
@@ -15,7 +16,7 @@ import { VaultController } from './vault.controller';
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([User, RefreshToken, ConnectedAccount, VaultKey]),
+    TypeOrmModule.forFeature([User, RefreshToken, ConnectedAccount, VaultKey, PasskeyCredential]),
     JwtModule.registerAsync({
       imports: [ConfigModule],
       inject: [ConfigService],

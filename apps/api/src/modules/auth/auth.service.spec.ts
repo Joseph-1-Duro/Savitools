@@ -103,6 +103,7 @@ describe('AuthService', () => {
   let refreshTokensRepo: ReturnType<typeof mockRepo>;
   let connectedAccountsRepo: ReturnType<typeof mockRepo>;
   let vaultKeysRepo: ReturnType<typeof mockRepo>;
+  let passkeysRepo: ReturnType<typeof mockRepo>;
   let jwt: ReturnType<typeof mockJwt>;
   let config: ReturnType<typeof mockConfig>;
 
@@ -123,6 +124,7 @@ describe('AuthService', () => {
     refreshTokensRepo = mockRepo();
     connectedAccountsRepo = mockRepo();
     vaultKeysRepo = mockRepo();
+    passkeysRepo = mockRepo();
     jwt = mockJwt();
     config = mockConfig();
 
@@ -131,12 +133,216 @@ describe('AuthService', () => {
       refreshTokensRepo as any,
       connectedAccountsRepo as any,
       vaultKeysRepo as any,
+      passkeysRepo as any,
       jwt as any,
       config as any,
     );
   });
 
   // ─── register ──────────────────────────────────────────────────────────────
+
+  describe('passkeys (Savitura/Savitools#218)', () => {
+    const user = {
+      id: 'u-passkey',
+      email: 'passkey@example.com',
+      emailVerified: true,
+      passwordHash,
+    };
+    const clientDataJSON = (challenge: string) =>
+      Buffer.from(
+        JSON.stringify({
+          type: 'webauthn.create',
+          challenge,
+          origin: 'http://localhost:3000',
+        }),
+      ).toString('base64url');
+
+    it('requires a valid reauthentication grant to register', async () => {
+      const grant = await service.requestPasskeyReauth(user.id, 'password123');
+      usersRepo.findOne.mockResolvedValue(user);
+      passkeysRepo.find.mockResolvedValue([]);
+
+      await expect(
+        service.beginPasskeyRegistration(user.id, 'forged-grant'),
+      ).rejects.toThrow(UnauthorizedException);
+      await expect(
+        service.beginPasskeyRegistration(user.id, grant.reauthToken),
+      ).resolves.toBeDefined();
+    });
+
+    it('rejects reauthentication with a wrong password', async () => {
+      await expect(
+        service.requestPasskeyReauth(user.id, 'wrong-password'),
+      ).rejects.toThrow(UnauthorizedException);
+    });
+
+    it('issues single-use, short-lived challenges bound to the RP', async () => {
+      const grant = await service.requestPasskeyReauth(user.id, 'password123');
+      usersRepo.findOne.mockResolvedValue(user);
+      passkeysRepo.find.mockResolvedValue([]);
+
+      const { options } = await service.beginPasskeyRegistration(
+        user.id,
+        grant.reauthToken,
+      );
+      expect(options.rp.name).toBe('SaviTools');
+      expect(options.challenge).toBeDefined();
+
+      // The challenge is stored for this user only.
+      const stored = (service as any).passkeyChallenges;
+      const entry = [...stored.values()].find(
+        (e: any) => e.challenge === options.challenge,
+      );
+      expect(entry.rpId).toBe('localhost');
+      expect(entry.type).toBe('registration');
+      expect(entry.expiresAt).toBeLessThanOrEqual(
+        Date.now() + 120_000,
+      );
+    });
+
+    it('revoked credentials cannot authenticate', async () => {
+      passkeysRepo.findOne.mockResolvedValue({
+        id: 'cred-1',
+        userId: user.id,
+        user,
+        credentialId: 'cred-id-1',
+        publicKey: Buffer.from('pubkey').toString('base64url'),
+        counter: 0,
+        transports: null,
+        revokedAt: new Date(),
+      });
+
+      await expect(
+        service.verifyPasskeyLogin({
+          id: 'cred-id-1',
+          rawId: 'cred-id-1',
+          type: 'public-key',
+          response: { challenge: 'x' } as any,
+        } as any),
+      ).rejects.toThrow(/PASSKEY_REVOKED/);
+    });
+
+    it('rejects an assertion whose challenge was already consumed', async () => {
+      const rpId = 'localhost';
+      (service as any).storePasskeyChallenge(
+        'u-passkey',
+        'assertion',
+        'challenge-abc',
+        rpId,
+      );
+
+      // Consume it once via the claim path (allowed-list branch returns
+      // early only when allowCredentials were used, so discoverable flow
+      // keys by userId).
+      (service as any).claimAssertionChallenge(
+        'challenge-abc',
+        'cred-id-1',
+        'u-passkey',
+        rpId,
+      );
+
+      expect(() =>
+        (service as any).claimAssertionChallenge(
+          'challenge-abc',
+          'cred-id-1',
+          'u-passkey',
+          rpId,
+        ),
+      ).toThrow(/PASSKEY_CHALLENGE_INVALID/);
+    });
+
+    it('rejects assertions with a credential outside the challenge allow-list', async () => {
+      const rpId = 'localhost';
+      const allowed = [{ id: 'cred-allowed' }];
+      (service as any).storePasskeyChallenge(
+        (service as any).userIdForChallenge(allowed),
+        'assertion',
+        'challenge-allow',
+        rpId,
+        allowed.map((c) => c.id),
+      );
+
+      expect(() =>
+        (service as any).claimAssertionChallenge(
+          'challenge-allow',
+          'cred-allowed',
+          'u1',
+          rpId,
+        ),
+      ).not.toThrow();
+
+      // Re-issue and try a foreign credential
+      (service as any).storePasskeyChallenge(
+        (service as any).userIdForChallenge(allowed),
+        'assertion',
+        'challenge-allow-2',
+        rpId,
+        allowed.map((c) => c.id),
+      );
+      expect(() =>
+        (service as any).claimAssertionChallenge(
+          'challenge-allow-2',
+          'cred-foreign',
+          'u2',
+          rpId,
+        ),
+      ).toThrow(/PASSKEY_CHALLENGE_MISMATCH/);
+    });
+
+    it('renames and revokes credentials only with a fresh reauth grant', async () => {
+      usersRepo.findOne.mockResolvedValue(user);
+      passkeysRepo.findOne.mockResolvedValue({
+        id: 'cred-1',
+        userId: user.id,
+        name: 'Old',
+        revokedAt: null,
+      });
+      passkeysRepo.save.mockImplementation(async (e: any) => e);
+
+      const grant = await service.requestPasskeyReauth(user.id, 'password123');
+
+      await expect(
+        service.renamePasskey('cred-1', user.id, 'New Name', 'forged'),
+      ).rejects.toThrow(UnauthorizedException);
+      await expect(
+        service.renamePasskey('cred-1', user.id, 'New Name', grant.reauthToken),
+      ).resolves.toBeUndefined();
+
+      const revokeGrant = await service.requestPasskeyReauth(
+        user.id,
+        'password123',
+      );
+      await expect(
+        service.revokePasskey('cred-1', user.id, revokeGrant.reauthToken),
+      ).resolves.toBeUndefined();
+
+      const saved: any = passkeysRepo.save.mock.calls.flat().pop();
+      expect(saved.revokedAt).toBeInstanceOf(Date);
+    });
+
+    it('lists credentials including revoked ones with their state', async () => {
+      passkeysRepo.find.mockResolvedValue([
+        {
+          id: 'cred-1',
+          name: 'MacBook',
+          createdAt: new Date(),
+          lastUsedAt: null,
+          revokedAt: null,
+        },
+        {
+          id: 'cred-2',
+          name: 'Phone',
+          createdAt: new Date(),
+          lastUsedAt: new Date(),
+          revokedAt: new Date(),
+        },
+      ]);
+
+      const list = await service.listPasskeys(user.id);
+      expect(list).toHaveLength(2);
+      expect(list.find((p) => p.id === 'cred-2')?.revokedAt).toBeInstanceOf(Date);
+    });
+  });
 
   describe('register', () => {
     it('creates a new user and returns { userId, message }', async () => {
@@ -265,6 +471,7 @@ describe('AuthService', () => {
         refreshTokensRepo as any,
         connectedAccountsRepo as any,
         vaultKeysRepo as any,
+        passkeysRepo as any,
         jwt as any,
         prodConfig as any,
       );
@@ -302,6 +509,7 @@ describe('AuthService', () => {
         refreshTokensRepo as any,
         connectedAccountsRepo as any,
         vaultKeysRepo as any,
+        passkeysRepo as any,
         jwt as any,
         prodConfig as any,
       );
@@ -350,6 +558,7 @@ describe('AuthService', () => {
         refreshTokensRepo as any,
         connectedAccountsRepo as any,
         vaultKeysRepo as any,
+        passkeysRepo as any,
         jwt as any,
         prodConfig as any,
       );
@@ -560,6 +769,7 @@ describe('AuthService', () => {
           table as any,
           connectedAccountsRepo as any,
           vaultKeysRepo as any,
+          passkeysRepo as any,
           jwt as any,
           config as any,
         );
@@ -908,6 +1118,7 @@ describe('AuthService', () => {
         refreshTokensRepo as any,
         connectedAccountsRepo as any,
         vaultKeysRepo as any,
+        passkeysRepo as any,
         jwt as any,
         prodConfig as any,
       );

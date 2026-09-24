@@ -213,6 +213,93 @@ export async function revokeSession(id: string) {
   );
 }
 
+/* ─── Passkeys (WebAuthn) ────────────────────────────────────────────────── */
+
+export interface PasskeyCredentialSummary {
+  id: string;
+  name: string;
+  createdAt: string;
+  lastUsedAt: string | null;
+  revokedAt: string | null;
+}
+
+export async function reauthenticate(password: string) {
+  return apiFetch<{ reauthToken: string; expiresIn: number }>(
+    "/auth/reauthenticate",
+    {
+      method: "POST",
+      body: JSON.stringify({ password }),
+    },
+  );
+}
+
+export async function beginPasskeyRegistration(reauthToken: string) {
+  return apiFetch<{ options: PublicKeyCredentialCreationOptionsJSON }>(
+    "/auth/passkeys/register/options",
+    {
+      method: "POST",
+      body: JSON.stringify({ reauthToken }),
+    },
+  );
+}
+
+export async function verifyPasskeyRegistration(input: {
+  reauthToken: string;
+  name: string;
+  registrationResponse: RegistrationResponseJSON;
+  transports?: string[];
+}) {
+  return apiFetch<{
+    passkey: { id: string; name: string; createdAt: string };
+  }>("/auth/passkeys/register", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export async function beginPasskeyLogin(email?: string) {
+  return apiFetch<{
+    options: PublicKeyCredentialRequestOptionsJSON;
+    allowCredentials?: Array<{ id: string }>;
+  }>("/auth/passkeys/login/options", {
+    method: "POST",
+    body: JSON.stringify({ email }),
+  });
+}
+
+export async function verifyPasskeyLogin(
+  assertionResponse: AuthenticationResponseJSON,
+) {
+  return apiFetch<{ user: AuthUser }>("/auth/passkeys/login", {
+    method: "POST",
+    body: JSON.stringify({ assertionResponse }),
+  });
+}
+
+export async function listPasskeys() {
+  return apiFetch<PasskeyCredentialSummary[]>("/auth/passkeys");
+}
+
+export async function renamePasskey(id: string, name: string, reauthToken: string) {
+  return apiFetch<{ success: boolean }>(
+    `/auth/passkeys/${encodeURIComponent(id)}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify({ name, reauthToken }),
+    },
+  );
+}
+
+export async function revokePasskey(id: string, reauthToken: string) {
+  return apiFetch<{ success: boolean }>(
+    `/auth/passkeys/${encodeURIComponent(id)}`,
+    {
+      method: "DELETE",
+      body: JSON.stringify({ reauthToken }),
+    },
+  );
+}
+
 export type WorkspaceTool = "sandbox" | "inspector" | "webhooks" | "composer";
 
 export async function getWorkspace(tool: WorkspaceTool) {

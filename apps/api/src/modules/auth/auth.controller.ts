@@ -6,6 +6,7 @@ import {
   HttpCode,
   Inject,
   Param,
+  Patch,
   Post,
   Req,
   Res,
@@ -31,6 +32,7 @@ import { CurrentUser } from './decorators/current-user.decorator';
 import { FluxaDto } from './dto/fluxa.dto';
 import { ForgotPasswordDto } from './dto/forgot-password.dto';
 import { LoginDto } from './dto/login.dto';
+import { PasskeyLoginVerifyDto, PasskeyReauthDto, PasskeyRegistrationVerifyDto, PasskeyRenameDto } from './dto/passkey.dto';
 import { RegisterDto } from './dto/register.dto';
 import { ResetPasswordDto } from './dto/reset-password.dto';
 import { VerifyEmailDto } from './dto/verify-email.dto';
@@ -314,6 +316,133 @@ export class AuthController {
           }
         : null,
     };
+  }
+
+  // ─── Passkeys (Savitura/Savitools#218) ────────────────────────────────────
+
+  @Post('reauthenticate')
+  @HttpCode(200)
+  @UseGuards(JwtAuthGuard)
+  @ApiCookieAuth()
+  @ApiOperation({
+    summary:
+      'Reauthenticate with a password to mint a short-lived grant for passkey management',
+  })
+  @ApiResponse({ status: 200, description: 'Reauthentication grant issued' })
+  @ApiResponse({ status: 401, description: 'Invalid password' })
+  async reauthenticate(
+    @CurrentUser() user: { id: string },
+    @Body() dto: PasskeyReauthDto,
+  ) {
+    return this.authService.requestPasskeyReauth(user.id, dto.password);
+  }
+
+  @Post('passkeys/register/options')
+  @HttpCode(200)
+  @UseGuards(JwtAuthGuard)
+  @ApiCookieAuth()
+  @ApiOperation({ summary: 'Begin passkey registration (requires a reauthentication grant)' })
+  async beginPasskeyRegistration(
+    @CurrentUser() user: { id: string },
+    @Body() dto: { reauthToken: string },
+  ) {
+    return this.authService.beginPasskeyRegistration(user.id, dto.reauthToken);
+  }
+
+  @Post('passkeys/register')
+  @HttpCode(200)
+  @UseGuards(JwtAuthGuard)
+  @ApiCookieAuth()
+  @ApiOperation({ summary: 'Verify an attestation and store the new passkey credential' })
+  async verifyPasskeyRegistration(
+    @CurrentUser() user: { id: string },
+    @Body() dto: PasskeyRegistrationVerifyDto,
+  ) {
+    const credential = await this.authService.verifyPasskeyRegistration(
+      user.id,
+      dto.reauthToken,
+      dto.name,
+      dto.registrationResponse as never,
+      dto.transports,
+    );
+    return {
+      passkey: {
+        id: credential.id,
+        name: credential.name,
+        createdAt: credential.createdAt,
+      },
+    };
+  }
+
+  @Post('passkeys/login/options')
+  @HttpCode(200)
+  @ApiOperation({ summary: 'Begin passkey assertion login' })
+  async beginPasskeyLogin(@Body() dto: { email?: string }) {
+    return this.authService.beginPasskeyLogin(dto.email);
+  }
+
+  @Post('passkeys/login')
+  @HttpCode(200)
+  @ApiOperation({
+    summary: 'Verify an assertion and receive the same access/refresh cookie session as password login',
+  })
+  async verifyPasskeyLogin(
+    @Body() dto: PasskeyLoginVerifyDto,
+    @Req() req: FastifyRequest,
+    @Res({ passthrough: true }) reply: FastifyReply,
+  ) {
+    const { user, tokens } = await this.authService.verifyPasskeyLogin(
+      dto.assertionResponse as never,
+      {
+        ipAddress: extractIp(req),
+        userAgent: req.headers['user-agent'],
+      },
+    );
+    this.setAuthCookies(reply, tokens.accessToken, tokens.refreshToken);
+    return {
+      user: {
+        id: user.id,
+        email: user.email,
+        emailVerified: user.emailVerified,
+        fluxaTenantId: user.fluxaTenantId,
+      },
+    };
+  }
+
+  @Get('passkeys')
+  @UseGuards(JwtAuthGuard)
+  @ApiCookieAuth()
+  @ApiOperation({ summary: 'List passkeys registered for the current account' })
+  async listPasskeys(@CurrentUser() user: { id: string }) {
+    return this.authService.listPasskeys(user.id);
+  }
+
+  @Patch('passkeys/:id')
+  @HttpCode(200)
+  @UseGuards(JwtAuthGuard)
+  @ApiCookieAuth()
+  @ApiOperation({ summary: 'Rename a passkey (requires a reauthentication grant)' })
+  async renamePasskey(
+    @Param('id') id: string,
+    @CurrentUser() user: { id: string },
+    @Body() dto: PasskeyRenameDto & { reauthToken: string },
+  ) {
+    await this.authService.renamePasskey(id, user.id, dto.name, dto.reauthToken);
+    return { success: true };
+  }
+
+  @Delete('passkeys/:id')
+  @HttpCode(200)
+  @UseGuards(JwtAuthGuard)
+  @ApiCookieAuth()
+  @ApiOperation({ summary: 'Revoke a passkey; revoked credentials can never authenticate (requires a reauthentication grant)' })
+  async revokePasskey(
+    @Param('id') id: string,
+    @CurrentUser() user: { id: string },
+    @Body() dto: { reauthToken: string },
+  ) {
+    await this.authService.revokePasskey(id, user.id, dto.reauthToken);
+    return { success: true };
   }
 
   // ─── Private ──────────────────────────────────────────────────────────────

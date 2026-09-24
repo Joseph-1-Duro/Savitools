@@ -3,6 +3,7 @@ import { DataSource } from 'typeorm';
 import { User } from '../modules/auth/entities/user.entity';
 import { RefreshToken } from '../modules/auth/entities/refresh-token.entity';
 import { ConnectedAccount } from '../modules/auth/entities/connected-account.entity';
+import { PasskeyCredential } from '../modules/auth/entities/passkey.entity';
 import { VaultKey } from '../modules/auth/entities/vault-key.entity';
 import { Workspace } from '../modules/workspace/entities/workspace.entity';
 import { ApiKey } from '../modules/playground/entities/api-key.entity';
@@ -19,6 +20,7 @@ import { AddMonitorStateAlerts1785312000000 } from './migrations/1785312000000-a
 import { AddAuthEnhancements1785398400000 } from './migrations/1785398400000-add-auth-enhancements';
 import { CreateTransactionReplay1785700000000 } from './migrations/1785700000000-create-transaction-replay';
 import { CreateNetworkSamples1785786400000 } from './migrations/1785786400000-create-network-samples';
+import { CreatePasskeys1786200000000 } from './migrations/1786200000000-create-passkeys';
 
 export default new DataSource({
   type: 'postgres',
@@ -27,6 +29,7 @@ export default new DataSource({
     User,
     RefreshToken,
     ConnectedAccount,
+    PasskeyCredential,
     VaultKey,
     Workspace,
     ApiKey,
@@ -45,6 +48,7 @@ export default new DataSource({
     AddAuthEnhancements1785398400000,
     CreateTransactionReplay1785700000000,
     CreateNetworkSamples1785786400000,
+    CreatePasskeys1786200000000,
   ],
   synchronize: false,
 });

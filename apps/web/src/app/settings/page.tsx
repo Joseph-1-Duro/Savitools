@@ -6,15 +6,21 @@ import { useUserPreferences } from '@/lib/preferences';
 import { ShortcutBadge } from '@/components/command-palette';
 import {
   beginFluxaOAuth,
+  beginPasskeyRegistration,
   ConnectedAccount,
   createVaultKey,
   deleteVaultKey,
   disconnectProvider,
   listConnectedAccounts,
+  listPasskeys,
   listSessions,
   listVaultKeys,
+  PasskeyCredentialSummary,
+  reauthenticate,
+  revokePasskey,
   revokeSession,
   Session,
+  verifyPasskeyRegistration,
   VaultKey,
   VaultKeyProvider,
 } from '@/lib/api';
@@ -436,6 +442,177 @@ function KeyboardNavigationSection() {
 
 // ─── Page ──────────────────────────────────────────────────────────────────────
 
+function PasskeysSection() {
+  const { user } = useAuth();
+  const [passkeys, setPasskeys] = useState<PasskeyCredentialSummary[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [newName, setNewName] = useState('');
+  const [password, setPassword] = useState('');
+  const [showRegister, setShowRegister] = useState(false);
+
+  const load = useCallback(async () => {
+    if (!user) return;
+    try {
+      const data = await listPasskeys();
+      setPasskeys(data);
+    } catch {
+      // non-fatal
+    } finally {
+      setLoading(false);
+    }
+  }, [user]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const requireReauth = async (password: string): Promise<string> => {
+    const { reauthToken } = await reauthenticate(password);
+    return reauthToken;
+  };
+
+  async function handleRegister() {
+    setError(null);
+    setBusy(true);
+    try {
+      const { startRegistration } = await import('@simplewebauthn/browser');
+      const reauthToken = await requireReauth(password);
+      const { options } = await beginPasskeyRegistration(reauthToken);
+      const attResp = await startRegistration({ optionsJSON: options });
+      await verifyPasskeyRegistration({
+        reauthToken,
+        name: newName.trim() || 'My passkey',
+        registrationResponse: attResp,
+      });
+      setShowRegister(false);
+      setPassword('');
+      setNewName('');
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Passkey registration failed.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleRevoke(id: string) {
+    setError(null);
+    setBusy(true);
+    try {
+      const reauthToken = await requireReauth(
+        password || window.prompt('Re-enter your password to confirm revocation:') || '',
+      );
+      await revokePasskey(id, reauthToken);
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to revoke passkey.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (!user) return null;
+
+  return (
+    <section className="border border-border rounded-lg p-5 space-y-4">
+      <div>
+        <h2 className="text-sm font-medium">Passkeys</h2>
+        <p className="text-sm text-muted-foreground mt-1">
+          Phishing-resistant sign-in credentials. Registration and changes
+          require a recent password reauthentication; password sign-in and
+          recovery keep working regardless.
+        </p>
+      </div>
+
+      {error ? <p className="text-sm text-destructive">{error}</p> : null}
+
+      {passkeys.length > 0 ? (
+        <div className="border-t border-border pt-4 space-y-3">
+          {passkeys.map((p) => (
+            <div key={p.id} className="flex items-center justify-between gap-3">
+              <div>
+                <p className="text-sm font-medium">{p.name}</p>
+                <p className="text-xs text-muted-foreground">
+                  {p.revokedAt
+                    ? 'Revoked — cannot authenticate'
+                    : `Added ${new Date(p.createdAt).toLocaleDateString()}`}
+                  {p.lastUsedAt
+                    ? ` · last used ${new Date(p.lastUsedAt).toLocaleDateString()}`
+                    : ''}
+                </p>
+              </div>
+              {!p.revokedAt ? (
+                <button
+                  onClick={() => void handleRevoke(p.id)}
+                  disabled={busy}
+                  className="rounded-md border border-border px-3 py-1.5 text-xs hover:border-destructive hover:text-destructive transition-colors disabled:opacity-50"
+                >
+                  Revoke
+                </button>
+              ) : (
+                <span className="text-xs text-muted-foreground">revoked</span>
+              )}
+            </div>
+          ))}
+        </div>
+      ) : (
+        <p className="text-xs text-muted-foreground border-t border-border pt-4">
+          {loading ? 'Loading passkeys…' : 'No passkeys registered yet.'}
+        </p>
+      )}
+
+      {showRegister ? (
+        <div className="border-t border-border pt-4 space-y-2">
+          <label className="text-xs text-muted-foreground block">
+            Confirm your password to continue
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              className="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+              autoComplete="current-password"
+            />
+          </label>
+          <label className="text-xs text-muted-foreground block">
+            Passkey name
+            <input
+              value={newName}
+              onChange={(e) => setNewName(e.target.value)}
+              placeholder="MacBook Touch ID"
+              className="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+            />
+          </label>
+          <div className="flex gap-2">
+            <button
+              onClick={() => void handleRegister()}
+              disabled={busy || !password}
+              className="rounded-md bg-primary text-primary-foreground px-3 py-1.5 text-xs font-medium disabled:opacity-50"
+            >
+              {busy ? 'Working…' : 'Register passkey'}
+            </button>
+            <button
+              onClick={() => setShowRegister(false)}
+              className="rounded-md border border-border px-3 py-1.5 text-xs"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      ) : (
+        <button
+          onClick={() => setShowRegister(true)}
+          disabled={busy || !user?.emailVerified}
+          className="rounded-md border border-border px-3 py-1.5 text-xs hover:border-foreground/30 transition-colors disabled:opacity-50"
+        >
+          Add a passkey
+        </button>
+      )}
+    </section>
+  );
+}
+
 export default function SettingsPage() {
   const { user } = useAuth();
 
@@ -467,6 +644,7 @@ export default function SettingsPage() {
 
       <KeyboardNavigationSection />
       <ConnectedAccountsSection />
+      <PasskeysSection />
       <VaultSection />
       <SessionsSection />
     </div>
