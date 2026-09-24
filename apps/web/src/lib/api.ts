@@ -926,6 +926,38 @@ export interface ComposerPayload {
   operations: Array<Record<string, unknown> & { type: string }>;
 }
 
+export interface DecodedEventTopic {
+  index: number;
+  friendlyName: string | null;
+  value: DecodedScVal | null;
+  rawHex: string;
+}
+
+export interface DecodedSorobanEvent {
+  index: number;
+  contractId: string | null;
+  type: string;
+  eventName: string | null;
+  signature: string;
+  topics: DecodedEventTopic[];
+  data: DecodedScVal | null;
+  inSuccessfulContractCall: boolean;
+  partial: boolean;
+}
+
+export interface GroupedSorobanEvents {
+  contractId: string | null;
+  events: DecodedSorobanEvent[];
+}
+
+export interface TransactionEventsResponse {
+  hash: string;
+  network: string;
+  count: number;
+  events: DecodedSorobanEvent[];
+  grouped: GroupedSorobanEvents[];
+}
+
 export interface TransactionBreakdown {
   hash: string;
   ledger: number;
@@ -943,6 +975,7 @@ export interface TransactionBreakdown {
   resultExplanation: string;
   operationCount: number;
   operations: DecodedOperationResult[];
+  sorobanEvents?: DecodedSorobanEvent[];
   rawJson: Record<string, unknown> | null;
   network: string;
   composerPayload: ComposerPayload | null;
@@ -963,6 +996,19 @@ export async function inspectTransaction(
 ) {
   return apiFetch<TransactionBreakdown>(
     `/inspector/tx/${encodeURIComponent(hash)}?network=${network}`,
+  );
+}
+
+export async function getTransactionEvents(
+  hash: string,
+  network: "testnet" | "mainnet" = "testnet",
+  filter?: { contractId?: string; eventName?: string },
+) {
+  const params = new URLSearchParams({ network });
+  if (filter?.contractId) params.set("contractId", filter.contractId);
+  if (filter?.eventName) params.set("eventName", filter.eventName);
+  return apiFetch<TransactionEventsResponse>(
+    `/inspector/tx/${encodeURIComponent(hash)}/events?${params.toString()}`,
   );
 }
 
