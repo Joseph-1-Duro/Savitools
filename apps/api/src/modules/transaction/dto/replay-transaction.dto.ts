@@ -1,4 +1,4 @@
-import { IsIn, IsOptional, IsString, IsBoolean, IsArray, ValidateNested } from 'class-validator';
+import { IsIn, IsOptional, IsString, IsArray, ValidateNested, Equals } from 'class-validator';
 import { Type } from 'class-transformer';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
@@ -49,13 +49,27 @@ export class ReplayTransactionDto {
   @Type(() => TransactionModificationsDto)
   modifications?: TransactionModificationsDto;
 
-  @ApiPropertyOptional({ description: 'Whether to sign and submit the replayed transaction' })
+  @ApiPropertyOptional({
+    description:
+      'Deprecated: server-side submission is no longer supported. Sign the returned unsigned XDR in the browser and submit it via the Composer sign/submit flow instead.',
+    deprecated: true,
+  })
   @IsOptional()
-  @IsBoolean()
-  submit?: boolean;
+  @Equals(undefined, {
+    message:
+      'submit is no longer supported by this endpoint. Sign modifiedXdr in the browser (see Composer sign/submit flow) and submit it separately.',
+  })
+  submit?: never;
 
-  @ApiPropertyOptional({ description: 'Secret key required if submit is true' })
+  @ApiPropertyOptional({
+    description:
+      'Deprecated: secret keys must never be sent to the server. Sign the returned unsigned XDR in the browser instead.',
+    deprecated: true,
+  })
   @IsOptional()
-  @IsString()
-  secretKey?: string;
+  @Equals(undefined, {
+    message:
+      'secretKey is no longer accepted by this endpoint. Sign modifiedXdr in the browser (see Composer sign/submit flow) instead of sending a secret key to the server.',
+  })
+  secretKey?: never;
 }
