@@ -259,17 +259,35 @@ export class AuthService {
       );
     }
 
-    let user =
-      currentUser ??
-      existingTenantUser ??
-      (await this.usersRepository.findOne({
-        where: { email: fluxaAccount.email.toLowerCase() },
-      }));
+    let user: User;
 
-    if (user) {
-      user.fluxaTenantId = fluxaAccount.tenantId;
-      if (!user.email) user.email = fluxaAccount.email.toLowerCase();
+    if (currentUser) {
+      // Authenticated linking: only the signed-in account may be attached, and
+      // attaching a new Fluxa tenant requires explicit re-confirmation. An
+      // email match must never select or mutate an existing account.
+      if (!existingTenantUser && !dto.confirmLink) {
+        throw new BadRequestException(
+          'Linking a Fluxa tenant to your account requires explicit confirmation',
+        );
+      }
+      user = currentUser;
+    } else if (existingTenantUser) {
+      // Unauthenticated return login is only permitted for a tenant that is
+      // already explicitly linked to an account.
+      user = existingTenantUser;
     } else {
+      // Unauthenticated signup: create a brand-new account. If the Fluxa
+      // email belongs to an existing local account, refuse instead of
+      // selecting or mutating it — the owner must sign in and link Fluxa
+      // from their settings with explicit confirmation.
+      const emailOwner = await this.usersRepository.findOne({
+        where: { email: fluxaAccount.email.toLowerCase() },
+      });
+      if (emailOwner) {
+        throw new ConflictException(
+          'An account with this email already exists. Sign in and link Fluxa from your settings.',
+        );
+      }
       user = this.usersRepository.create({
         email: fluxaAccount.email.toLowerCase(),
         passwordHash: null,
@@ -277,6 +295,9 @@ export class AuthService {
         emailVerified: true, // SSO-linked accounts are considered verified
       });
     }
+
+    user.fluxaTenantId = fluxaAccount.tenantId;
+    if (!user.email) user.email = fluxaAccount.email.toLowerCase();
 
     await this.usersRepository.save(user);
     const tokens = await this.issueSession(user, ctx);
@@ -621,6 +642,12 @@ export class AuthService {
       `${this.configService.get<string>('WEB_ORIGIN', 'http://localhost:3000')}/auth/fluxa`;
 
     if (!fluxaTokenUrl || !clientId || !clientSecret) {
+      if (this.configService.get<string>('NODE_ENV') === 'production') {
+        // Fail closed: never treat an OAuth code as a token in production.
+        throw new ServiceUnavailableException(
+          'Fluxa OAuth token exchange is not configured',
+        );
+      }
       // Dev stub: treat the code itself as the API key
       this.logger.warn('[fluxa-oauth] Token exchange not configured, using code as stub key');
       return code;

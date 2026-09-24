@@ -103,7 +103,7 @@ export async function getCurrentUser() {
 export async function connectFluxa(apiKey: string) {
   return apiFetch<{ user: AuthUser }>("/auth/fluxa", {
     method: "POST",
-    body: JSON.stringify({ apiKey }),
+    body: JSON.stringify({ apiKey, confirmLink: true }),
   });
 }
 
