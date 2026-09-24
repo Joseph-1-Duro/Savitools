@@ -4,17 +4,20 @@ import { useCallback, useEffect, useState } from 'react';
 import {
   getWorkspace,
   saveWorkspace,
-  listWorkspaces,
-  createWorkspace,
-  updateWorkspace,
-  deleteWorkspace,
-  duplicateWorkspace,
-  getWorkspaceById,
-  exportWorkspace as apiExportWorkspace,
-  importWorkspace as apiImportWorkspace,
-  generateShareLink as apiGenerateShareLink,
   WorkspaceTool,
 } from './api';
+import {
+  listComposerWorkspaces,
+  createComposerWorkspace,
+  getComposerWorkspace,
+  updateComposerWorkspace,
+  renameComposerWorkspace,
+  deleteComposerWorkspace,
+  duplicateComposerWorkspace,
+  exportComposerWorkspace,
+  importComposerWorkspace,
+  shareComposerWorkspace,
+} from './composer-api';
 import { useAuth } from './auth-context';
 
 function guestStorageKey(tool: WorkspaceTool): string {
@@ -231,8 +234,8 @@ export function useWorkspaceManager(tool: WorkspaceTool) {
     setError(null);
     if (isAuthenticated) {
       try {
-        const response = await listWorkspaces(tool);
-        setWorkspaces(response.data);
+        const response = await listComposerWorkspaces();
+        setWorkspaces(response.workspaces);
       } catch {
         setError('Failed to load workspaces');
         setWorkspaces([]);
@@ -255,23 +258,20 @@ export function useWorkspaceManager(tool: WorkspaceTool) {
 
       if (isAuthenticated) {
         if (existing) {
-          const response = await updateWorkspace(existing.id, {
-            composerState: state.composerState,
-            operations: state.operations,
-          });
+          const response = await updateComposerWorkspace(existing.id, { ...state });
           const updated: WorkspaceSummary = {
-            id: response.data.id,
-            name: response.data.name,
-            updatedAt: response.data.updatedAt,
+            id: response.id,
+            name: response.name,
+            updatedAt: response.updatedAt,
           };
           setWorkspaces((prev) => prev.map((w) => (w.id === updated.id ? updated : w)));
           return updated;
         } else {
-          const response = await createWorkspace(tool, name, state);
+          const response = await createComposerWorkspace({ name, data: { ...state } });
           const created: WorkspaceSummary = {
-            id: response.data.id,
-            name: response.data.name,
-            updatedAt: response.data.updatedAt,
+            id: response.id,
+            name: response.name,
+            updatedAt: response.updatedAt,
           };
           setWorkspaces((prev) => [...prev, created]);
           return created;
@@ -300,10 +300,10 @@ export function useWorkspaceManager(tool: WorkspaceTool) {
   const loadWorkspace = useCallback(
     async (id: string): Promise<WorkspaceState | null> => {
       if (isAuthenticated) {
-        const response = await getWorkspaceById(id);
+        const response = await getComposerWorkspace(id);
         return {
-          composerState: response.data.composerState,
-          operations: response.data.operations,
+          composerState: (response.data.composerState ?? {}) as Record<string, unknown>,
+          operations: (response.data.operations ?? []) as unknown[],
         };
       } else {
         return readGuestWorkspaceData(tool, id);
@@ -315,11 +315,11 @@ export function useWorkspaceManager(tool: WorkspaceTool) {
   const renameWorkspace = useCallback(
     async (id: string, newName: string) => {
       if (isAuthenticated) {
-        const response = await updateWorkspace(id, { name: newName });
+        const response = await renameComposerWorkspace(id, newName);
         const updated: WorkspaceSummary = {
-          id: response.data.id,
-          name: response.data.name,
-          updatedAt: response.data.updatedAt,
+          id: response.id,
+          name: response.name,
+          updatedAt: response.updatedAt,
         };
         setWorkspaces((prev) => prev.map((w) => (w.id === id ? updated : w)));
       } else {
@@ -337,7 +337,7 @@ export function useWorkspaceManager(tool: WorkspaceTool) {
   const deleteWorkspace = useCallback(
     async (id: string) => {
       if (isAuthenticated) {
-        await deleteWorkspace(id);
+        await deleteComposerWorkspace(id);
         setWorkspaces((prev) => prev.filter((w) => w.id !== id));
       } else {
         removeGuestWorkspaceData(tool, id);
@@ -352,11 +352,11 @@ export function useWorkspaceManager(tool: WorkspaceTool) {
   const duplicateWorkspace = useCallback(
     async (id: string) => {
       if (isAuthenticated) {
-        const response = await duplicateWorkspace(id);
+        const response = await duplicateComposerWorkspace(id);
         const created: WorkspaceSummary = {
-          id: response.data.id,
-          name: response.data.name,
-          updatedAt: response.data.updatedAt,
+          id: response.id,
+          name: response.name,
+          updatedAt: response.updatedAt,
         };
         setWorkspaces((prev) => [...prev, created]);
       } else {
@@ -381,8 +381,14 @@ export function useWorkspaceManager(tool: WorkspaceTool) {
   const exportWorkspace = useCallback(
     async (id: string): Promise<string> => {
       if (isAuthenticated) {
-        const response = await apiExportWorkspace(id);
-        return response.data;
+        const response = await exportComposerWorkspace(id);
+        return JSON.stringify({
+          id: response.id,
+          name: response.name,
+          updatedAt: response.updatedAt,
+          composerState: response.data.composerState as Record<string, unknown>,
+          operations: response.data.operations as unknown[],
+        });
       } else {
         const data = readGuestWorkspaceData(tool, id);
         if (!data) throw new Error('Workspace not found');
@@ -403,11 +409,11 @@ export function useWorkspaceManager(tool: WorkspaceTool) {
       };
 
       if (isAuthenticated) {
-        const response = await apiImportWorkspace(tool, json);
+        const response = await importComposerWorkspace({ name, data: { ...state } });
         const created: WorkspaceSummary = {
-          id: response.data.id,
-          name: response.data.name,
-          updatedAt: response.data.updatedAt,
+          id: response.id,
+          name: response.name,
+          updatedAt: response.updatedAt,
         };
         setWorkspaces((prev) => [...prev, created]);
         return created;
@@ -427,8 +433,8 @@ export function useWorkspaceManager(tool: WorkspaceTool) {
   const generateShareLink = useCallback(
     async (id: string, expiresInDays: number = 7): Promise<WorkspaceShareLink> => {
       if (isAuthenticated) {
-        const response = await apiGenerateShareLink(id, expiresInDays);
-        return response.data;
+        const response = await shareComposerWorkspace(id);
+        return { url: response.url, expiresAt: response.expiresAt };
       } else {
         const token = generateId();
         const expiresAt = new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000).toISOString();

@@ -43,6 +43,28 @@ export async function apiFetch<T>(
   return parseJson<T>(response);
 }
 
+export async function downloadCsv(path: string, filename: string) {
+  const response = await fetch(`${API_URL}/v1${path}`, {
+    credentials: "include",
+  });
+
+  if (!response.ok) {
+    const body = (await response.json().catch(() => ({}))) as ApiErrorBody;
+    const message = Array.isArray(body.message)
+      ? body.message.join(", ")
+      : (body.message ?? response.statusText);
+    throw new Error(message);
+  }
+
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 export async function register(email: string, password: string) {
   return apiFetch<{ userId: string; message: string }>("/auth/register", {
     method: "POST",

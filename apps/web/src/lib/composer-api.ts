@@ -127,7 +127,7 @@ export async function simulateTransaction(
 export async function submitToHorizon(xdr: string, network: 'testnet' | 'mainnet' = 'testnet'): Promise<{ success: boolean; hash?: string; error?: string }> {
   const horizonUrl =
     network === 'mainnet'
-      ? 'https://cassino.stellar.org'
+      ? 'https://horizon.stellar.org'
       : 'https://horizon-testnet.stellar.org';
 
   try {

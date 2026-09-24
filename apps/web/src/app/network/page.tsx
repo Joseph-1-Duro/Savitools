@@ -35,7 +35,7 @@ import Link from "next/link";
 import {
   getNetworkHistory,
   getNetworkStatus,
-  getNetworkProfiles,
+  listNetworkProfiles,
   createNetworkProfile,
   updateNetworkProfile,
   deleteNetworkProfile,
@@ -49,6 +49,9 @@ import {
   NetworkProfile,
 } from "@/lib/api";
 
+const MAINNET_PASSPHRASE = "Public Global Stellar Network ; September 2015";
+const TESTNET_PASSPHRASE = "Test SDF Network ; September 2015";
+
 const WINDOWS = [
   { label: "1h", minutes: 60 },
   { label: "6h", minutes: 360 },
@@ -56,7 +59,7 @@ const WINDOWS = [
 ];
 
 export default function NetworkStatusPage() {
-  const [network, setNetwork] = useState<NetworkChoice | string>("mainnet");
+  const [network, setNetwork] = useState<NetworkChoice>("mainnet");
   const [windowMinutes, setWindowMinutes] = useState(60);
   const [status, setStatus] = useState<NetworkStatusResult | null>(null);
   const [history, setHistory] = useState<NetworkHistoryResult | null>(null);
@@ -83,11 +86,9 @@ export default function NetworkStatusPage() {
     async function fetchData() {
       try {
         setError("");
-        const activeProfile = profiles.find((p) => p.id === activeProfileId);
-        const networkParam = activeProfile?.horizonUrl ?? network;
         const [statusData, historyData] = await Promise.all([
-          getNetworkStatus(networkParam as NetworkChoice),
-          getNetworkHistory(networkParam as NetworkChoice, windowMinutes),
+          getNetworkStatus(network),
+          getNetworkHistory(network, windowMinutes),
         ]);
 
         if (!cancelled) {
@@ -110,7 +111,7 @@ export default function NetworkStatusPage() {
       cancelled = true;
       clearInterval(interval);
     };
-  }, [network, windowMinutes, activeProfileId, profiles]);
+  }, [network, windowMinutes]);
 
   useEffect(() => {
     fetchProfiles();
@@ -118,7 +119,7 @@ export default function NetworkStatusPage() {
 
   async function fetchProfiles() {
     try {
-      const data = await getNetworkProfiles();
+      const data = await listNetworkProfiles();
       setProfiles(data);
       const defaultProfile = data.find((p) => p.isDefault);
       if (defaultProfile) {
@@ -145,13 +146,23 @@ export default function NetworkStatusPage() {
       const profile = profiles.find((p) => p.id === value);
       if (profile) {
         setActiveProfileId(profile.id);
-        setNetwork(profile.horizonUrl);
+        // Status/history endpoints only accept built-in networks; resolve a
+        // custom profile to its matching built-in network explicitly instead
+        // of casting its Horizon URL to NetworkChoice.
+        if (profile.networkPassphrase === MAINNET_PASSPHRASE) {
+          setNetwork("mainnet");
+        } else if (profile.networkPassphrase === TESTNET_PASSPHRASE) {
+          setNetwork("testnet");
+        }
         try {
-          const serverPassphrase = await verifyNetworkPassphrase(profile.horizonUrl);
+          const verification = await verifyNetworkPassphrase(
+            profile.horizonUrl,
+            profile.networkPassphrase,
+          );
           setPassphraseWarning(
-            serverPassphrase === profile.networkPassphrase
+            verification.match
               ? ""
-              : `Warning: Horizon network passphrase "${serverPassphrase}" does not match profile passphrase "${profile.networkPassphrase}".`
+              : `Warning: Horizon network passphrase "${verification.networkPassphrase}" does not match profile passphrase "${profile.networkPassphrase}".`
           );
         } catch {
           setPassphraseWarning("Unable to verify network passphrase for this Horizon URL.");
@@ -181,7 +192,7 @@ export default function NetworkStatusPage() {
       } else {
         await createNetworkProfile(profileForm);
       }
-      const data = await getNetworkProfiles();
+      const data = await listNetworkProfiles();
       setProfiles(data);
       resetProfileForm();
     } catch (err) {
@@ -196,7 +207,7 @@ export default function NetworkStatusPage() {
     if (!confirm("Delete this network profile?")) return;
     try {
       await deleteNetworkProfile(id);
-      const data = await getNetworkProfiles();
+      const data = await listNetworkProfiles();
       setProfiles(data);
       if (activeProfileId === id) {
         setActiveProfileId(null);
@@ -229,7 +240,7 @@ export default function NetworkStatusPage() {
       const text = await file.text();
       const parsed = JSON.parse(text);
       await importNetworkProfile(parsed);
-      const data = await getNetworkProfiles();
+      const data = await listNetworkProfiles();
       setProfiles(data);
     } catch (err) {
       console.error(err);
@@ -247,6 +258,8 @@ export default function NetworkStatusPage() {
       })),
     [history],
   );
+
+  const activeProfile = profiles.find((p) => p.id === activeProfileId) ?? null;
 
   if (loading && !status) {
     return (
@@ -489,7 +502,7 @@ export default function NetworkStatusPage() {
         <MetricCard
           icon={<Activity className="h-5 w-5" />}
           label="Network"
-          value={network}
+          value={activeProfile ? activeProfile.name : network}
           detail={networkUp ? "Sampling active" : "No recent uptime"}
         />
         <MetricCard
