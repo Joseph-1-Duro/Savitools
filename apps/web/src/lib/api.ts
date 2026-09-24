@@ -1169,6 +1169,38 @@ export async function fetchSepSupport(domain: string) {
   );
 }
 
+export interface TransferLinkResult {
+  sep: string;
+  endpoint: string;
+  url: string;
+  asset: string;
+  amount: string;
+  warning: string;
+}
+
+export async function previewTransferLink(input: {
+  domain: string;
+  sep: string;
+  asset: string;
+  amount: string;
+  memo?: string;
+  callback?: string;
+  account?: string;
+}) {
+  const params = new URLSearchParams({
+    domain: input.domain,
+    sep: input.sep,
+    asset: input.asset,
+    amount: input.amount,
+  });
+  if (input.memo) params.set("memo", input.memo);
+  if (input.callback) params.set("callback", input.callback);
+  if (input.account) params.set("account", input.account);
+  return apiFetch<TransferLinkResult>(
+    `/federation/link-preview?${params.toString()}`,
+  );
+}
+
 /* ─── Account Relationship Graph ───────────────────────────────────────── */
 
 export type GraphMode = "signers" | "offers" | "payments" | "all";

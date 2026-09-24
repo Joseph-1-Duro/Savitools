@@ -112,6 +112,34 @@ export interface SepResult {
   seps: SepInfo[];
 }
 
+// ─── Transfer request links (Savitura/Savitools#217) ────────────────────────
+
+export type TransferRequestSep = '6' | '24' | '31';
+
+export interface TransferLinkParams {
+  sep: TransferRequestSep;
+  asset: string;
+  amount: string;
+  memo?: string;
+  callback?: string;
+  account?: string;
+  type?: 'deposit' | 'withdraw';
+}
+
+export interface TransferLinkResult {
+  sep: TransferRequestSep;
+  endpoint: string;
+  url: string;
+  asset: string;
+  amount: string;
+  warning: string;
+}
+
+const PUBLIC_KEY_RE = /^G[A-Z2-7]{55}$/;
+/** Decimal string only — never routed through Number to avoid float conversion. */
+const DECIMAL_STRING_RE = /^\d+(\.\d+)?$/;
+const HTTPS_URL_RE = /^https:\/\/[^\s]+$/i;
+
 const REQUIRED_TOML_FIELDS = ['ACCOUNTS'] as const;
 
 /**
@@ -642,6 +670,126 @@ export class FederationService {
     }
 
     return { seps };
+  }
+
+  // ─── GET /federation/link-preview (Savitura/Savitools#217) ───────────────
+
+  /**
+   * Build a standards-aware anchor transfer request link from stellar.toml.
+   * The returned URL is copy-only: SaviTools never signs or submits it.
+   */
+  async buildTransferRequestLink(
+    domain: string,
+    params: TransferLinkParams,
+  ): Promise<TransferLinkResult> {
+    const cleanDomain = stripProtocol(domain.trim());
+    if (!isDomain(cleanDomain)) {
+      throw new BadRequestException(`Invalid domain: ${domain}`);
+    }
+
+    // Amounts and memos stay strings end-to-end — no floating-point conversion.
+    if (!DECIMAL_STRING_RE.test(params.amount)) {
+      throw new BadRequestException(
+        'amount must be a non-negative decimal string (e.g. "100.50")',
+      );
+    }
+
+    if (params.callback && !HTTPS_URL_RE.test(params.callback)) {
+      throw new BadRequestException(
+        'callback must be a well-formed https:// URL',
+      );
+    }
+
+    if (params.sep !== '31' && !params.account) {
+      throw new BadRequestException(
+        `account (Stellar public key G…) is required for SEP-${params.sep} request links`,
+      );
+    }
+    if (params.account && !PUBLIC_KEY_RE.test(params.account)) {
+      throw new BadRequestException('account must be a Stellar public key (G…)');
+    }
+
+    const tomlData = await this.fetchToml(cleanDomain);
+
+    const endpointBySep: Record<TransferRequestSep, string | undefined> = {
+      '6': (tomlData.TRANSFER_SERVER as string | undefined) ?? undefined,
+      '24': (tomlData.TRANSFER_SERVER_SEP0024 as string | undefined) ?? undefined,
+      '31': (tomlData.DIRECT_PAYMENT_SERVER as string | undefined) ?? undefined,
+    };
+    const endpoint = endpointBySep[params.sep];
+    if (!endpoint) {
+      throw new BadRequestException(
+        `Domain ${cleanDomain} does not declare a ` +
+          `${params.sep === '6' ? 'TRANSFER_SERVER' : params.sep === '24' ? 'TRANSFER_SERVER_SEP0024' : 'DIRECT_PAYMENT_SERVER'} ` +
+          `endpoint in its stellar.toml, so SEP-${params.sep} request links are unavailable`,
+      );
+    }
+
+    const currencies = Array.isArray(tomlData.CURRENCIES)
+      ? (tomlData.CURRENCIES as Record<string, unknown>[])
+      : [];
+    const supportedCodes = new Set(
+      currencies.map((c) => String(c.CODE ?? '').toUpperCase()),
+    );
+    if (!supportedCodes.has(params.asset.toUpperCase())) {
+      throw new BadRequestException(
+        `Asset '${params.asset}' is not supported by ${cleanDomain}. Supported assets: ` +
+          `${[...supportedCodes].join(', ') || '(none declared)'}`,
+      );
+    }
+
+    const base = endpoint.replace(/\/$/, '');
+    let url: string;
+    switch (params.sep) {
+      case '6': {
+        const flow = params.type === 'withdraw' ? 'withdraw' : 'deposit';
+        const query = new URLSearchParams({
+          type: flow,
+          asset_code: params.asset,
+          account: params.account as string,
+          amount: params.amount,
+        });
+        if (params.memo !== undefined) {
+          query.set('memo', params.memo);
+          query.set('memo_type', 'text');
+        }
+        if (params.callback) query.set('callback', params.callback);
+        url = `${base}/transactions?${query.toString()}`;
+        break;
+      }
+      case '24': {
+        const query = new URLSearchParams({
+          asset_code: params.asset,
+          amount: params.amount,
+          account: params.account as string,
+        });
+        if (params.memo !== undefined) query.set('memo', params.memo);
+        if (params.callback) query.set('callback', params.callback);
+        url = `${base}/?${query.toString()}`;
+        break;
+      }
+      case '31': {
+        const query = new URLSearchParams({
+          asset_code: params.asset,
+          amount: params.amount,
+        });
+        if (params.account) query.set('account', params.account);
+        if (params.callback) query.set('destination', params.callback);
+        if (params.memo !== undefined) query.set('memo', params.memo);
+        url = `${base}/?${query.toString()}`;
+        break;
+      }
+    }
+
+    return {
+      sep: params.sep,
+      endpoint: base,
+      url,
+      asset: params.asset,
+      amount: params.amount,
+      warning:
+        'Preview only: SaviTools will not sign or submit this request. Open the link yourself after reviewing the anchor.',
+    };
   }
 
   // ─── Helpers ────────────────────────────────────────────────────────────
