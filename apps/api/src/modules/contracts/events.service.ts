@@ -8,11 +8,7 @@ import {
 import { ConfigService } from "@nestjs/config";
 import { rpc, StrKey } from "@stellar/stellar-sdk";
 import { rpcServer } from "../monitor/horizon";
-import {
-  SIGNATURE_HEADER,
-  TIMESTAMP_HEADER,
-  signBody,
-} from '../webhook/signature';
+import { signatureHeaders } from "../webhook/signature";
 import {
   MAX_WEBHOOK_REDIRECTS,
   assertSafeWebhookDestination,
@@ -299,10 +295,9 @@ export class EventsService {
 
     if (secret) {
       // Same wire format as WebhookService and the notification worker:
-      // timestamped hex HMAC-SHA256 over `<timestamp>.<body>`.
-      const signed = signBody({ secret, body });
-      headers[SIGNATURE_HEADER] = signed.signature;
-      headers[TIMESTAMP_HEADER] = signed.timestamp;
+      // timestamped hex HMAC-SHA256 over `<timestamp>.<body>`, where `body` is
+      // the exact string handed to fetch below.
+      Object.assign(headers, signatureHeaders({ secret, body }));
     }
 
     const startedAt = Date.now();

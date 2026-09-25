@@ -1,8 +1,28 @@
-import { BadGatewayException, BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { BadGatewayException, BadRequestException, Injectable, Logger, NotFoundException, Optional } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { SendWebhookDto } from './dto/send-webhook.dto';
 import { WEBHOOK_TEMPLATES, WebhookTemplate } from './webhook-templates';
 import { assertSafeWebhookDestination, MAX_WEBHOOK_REDIRECTS } from './ssrf-guard';
+import {
+  LEGACY_ISO_TIMESTAMP_HEADER,
+  LEGACY_SIGNATURE_HEADER,
+  SIGNATURE_HEADER,
+  TIMESTAMP_HEADER,
+  WebhookSigningStatus,
+  isLegacySignedRequest,
+  signatureHeaders,
+  signingStatus,
+} from './signature';
 import * as crypto from 'crypto';
+
+export interface WebhookSignatureInfo {
+  /** Exact value sent in TIMESTAMP_HEADER: integer Unix seconds. */
+  timestamp: string;
+  /** The exact request body bytes that were signed and put on the wire. */
+  body: string;
+  /** Exact value sent in SIGNATURE_HEADER, e.g. `sha256=<hex>`. */
+  signature: string;
+}
 
 export interface WebhookHistoryEntry {
   id: string;
@@ -18,6 +38,22 @@ export interface WebhookHistoryEntry {
   latencyMs: number;
   error?: string;
   repeatIndex?: number;
+  /**
+   * The timestamp and bytes this delivery was signed over, so a receiver (and
+   * the Webhook Tester UI) can recompute the exact same signature instead of
+   * guessing at the payload serialisation. Present only on signed deliveries.
+   *
+   * `body` duplicates `payload` deliberately: echoing the serialised bytes is
+   * what makes the pair verifiable, and re-deriving them is how the two sides
+   * drifted apart in the first place.
+   */
+  signature?: WebhookSignatureInfo;
+  /**
+   * Set on entries recorded before the timestamped contract landed: they carry
+   * the legacy body-only signature, which no current verifier accepts. Replay
+   * strips those headers and re-signs under the current format.
+   */
+  legacySignature?: boolean;
 }
 
 export const OUTBOUND_TIMEOUT_MS = 10_000;
@@ -36,6 +72,33 @@ function redactHeaders(headers: Record<string, string>): Record<string, string> 
     redacted[key] = SECRET_HEADER_PATTERN.test(key) ? REDACTED : value;
   }
   return redacted;
+}
+
+const RECORDED_SIGNATURE_HEADER_NAMES = new Set(
+  [
+    LEGACY_SIGNATURE_HEADER,
+    LEGACY_ISO_TIMESTAMP_HEADER,
+    SIGNATURE_HEADER,
+    TIMESTAMP_HEADER,
+  ].map((name) => name.toLowerCase()),
+);
+
+/**
+ * Drops every signing header from a replay. Recorded values cannot be reused:
+ * the legacy signature covered the body alone, its ISO timestamp is not the
+ * integer-seconds value the current contract signs, and a recorded
+ * `X-SaviTools-Timestamp` belongs to a previous delivery's clock. The replay
+ * decides its own signing state from scratch, so the request never carries a
+ * timestamp that disagrees with the signature beside it.
+ */
+function stripRecordedSignatureHeaders(
+  headers: Record<string, string>,
+): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(headers).filter(
+      ([name]) => !RECORDED_SIGNATURE_HEADER_NAMES.has(name.toLowerCase()),
+    ),
+  );
 }
 
 async function readBodyWithLimit(
@@ -82,6 +145,24 @@ export class WebhookService {
   private readonly logger = new Logger(WebhookService.name);
   private historyByUser = new Map<string, WebhookHistoryEntry[]>();
   private templates: WebhookTemplate[] = [...WEBHOOK_TEMPLATES];
+
+  constructor(@Optional() private readonly configService?: ConfigService) {}
+
+  /**
+   * The signing secret for this delivery: an explicit per-request secret wins,
+   * otherwise the deployment-wide `WEBHOOK_SIGNING_SECRET`. Same precedence as
+   * contract-event replay, so one receiver can verify every delivery with one
+   * contract. Undefined means the request goes out unsigned.
+   */
+  private resolveSecret(requestSecret?: string): string | undefined {
+    const secret = requestSecret || this.configService?.get<string>('WEBHOOK_SIGNING_SECRET');
+    return secret || undefined;
+  }
+
+  /** Whether the deployment signs outbound webhooks without a per-request secret. */
+  getSigningStatus(): WebhookSigningStatus {
+    return signingStatus({ enabled: this.resolveSecret() !== undefined });
+  }
 
   getTemplates(): WebhookTemplate[] {
     return this.templates;
@@ -198,6 +279,8 @@ export class WebhookService {
 
     await assertSafeWebhookDestination(new URL(dto.endpointUrl));
 
+    const secret = this.resolveSecret(dto.secret);
+
     const results: WebhookHistoryEntry[] = [];
 
     for (let i = 0; i < repeatCount; i++) {
@@ -209,16 +292,18 @@ export class WebhookService {
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
         'X-Webhook-Event': dto.eventType,
-        'X-Timestamp': new Date().toISOString(),
-        ...(dto.headers ?? {}),
+        // A caller cannot reintroduce the pre-timestamped pair through custom
+        // headers, so a delivery never carries two competing signatures.
+        ...stripRecordedSignatureHeaders(dto.headers ?? {}),
       };
 
-      if (dto.secret) {
-        const signature = crypto
-          .createHmac('sha256', dto.secret)
-          .update(body)
-          .digest('hex');
-        headers['X-Webhook-Signature'] = `sha256=${signature}`;
+      // `body` above is the exact string handed to fetch below, so the bytes
+      // signed are the bytes sent — no re-serialisation in between.
+      let signatureInfo: WebhookSignatureInfo | undefined;
+      if (secret) {
+        const signed = signatureHeaders({ secret, body });
+        Object.assign(headers, signed);
+        signatureInfo = { timestamp: signed[TIMESTAMP_HEADER], body, signature: signed[SIGNATURE_HEADER] };
       }
 
       let responseStatus: number | null = null;
@@ -268,6 +353,7 @@ export class WebhookService {
         latencyMs,
         error: errorMessage,
         repeatIndex: repeatCount > 1 ? i + 1 : undefined,
+        signature: signatureInfo,
       };
 
       this.recordHistory(userId, entry);
@@ -278,7 +364,21 @@ export class WebhookService {
   }
 
   getHistory(userId: string): WebhookHistoryEntry[] {
-    return this.historyByUser.get(userId) ?? [];
+    return this.annotateLegacyEntries(this.historyByUser.get(userId) ?? []);
+  }
+
+  /**
+   * Marks entries recorded under the pre-timestamped format so the UI can
+   * explain that a replay will be re-signed. Applied on read so entries held in
+   * memory across a deploy are migrated lazily, without a write.
+   */
+  private annotateLegacyEntries(entries: WebhookHistoryEntry[]): WebhookHistoryEntry[] {
+    for (const entry of entries) {
+      if (entry.legacySignature === undefined && isLegacySignedRequest(entry.requestHeaders)) {
+        entry.legacySignature = true;
+      }
+    }
+    return entries;
   }
 
   async replayWebhook(userId: string, id: string): Promise<WebhookHistoryEntry> {
@@ -288,9 +388,12 @@ export class WebhookService {
     }
 
     // Redacted secret-shaped headers cannot be reconstructed; skip them
-    // instead of transmitting the placeholder value.
-    const headers = Object.fromEntries(
-      Object.entries(entry.requestHeaders).filter(([, value]) => value !== REDACTED),
+    // instead of transmitting the placeholder value. Recorded signing headers go
+    // too, for the reasons in `stripRecordedSignatureHeaders`.
+    const headers = stripRecordedSignatureHeaders(
+      Object.fromEntries(
+        Object.entries(entry.requestHeaders).filter(([, value]) => value !== REDACTED),
+      ),
     );
 
     return (await this.sendWebhook(userId, {
@@ -299,6 +402,10 @@ export class WebhookService {
       payload: entry.payload,
       method: entry.method as 'GET' | 'POST' | 'PUT' | 'PATCH',
       headers,
+      // A recorded entry's secret is never stored (only its redacted headers),
+      // so a signed replay falls back to the deployment-wide secret and is
+      // otherwise sent unsigned.
+      secret: this.resolveSecret(),
     })) as WebhookHistoryEntry;
   }
 }

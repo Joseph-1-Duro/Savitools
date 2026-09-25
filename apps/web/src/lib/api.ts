@@ -936,6 +936,17 @@ export interface WebhookSendRequest {
   repeatIntervalMs?: number;
 }
 
+/**
+ * The timestamp and bytes a delivery was signed over, as reported by the API.
+ * Lets the UI recompute the identical signature instead of guessing at the
+ * payload serialisation.
+ */
+export interface WebhookSignatureInfo {
+  timestamp: string;
+  body: string;
+  signature: string;
+}
+
 export interface WebhookHistoryEntry {
   id: string;
   eventType: string;
@@ -951,10 +962,30 @@ export interface WebhookHistoryEntry {
   timestamp: number;
   error?: string;
   repeatIndex?: number;
+  signature?: WebhookSignatureInfo;
+  legacySignature?: boolean;
+}
+
+export interface WebhookSigningStatus {
+  enabled: boolean;
+  algorithm: "hmac-sha256";
+  signatureHeader: string;
+  timestampHeader: string;
+  replayWindowSeconds: number;
+  signedPayloadFormat: string;
+  signatureFormat: string;
+  signedPayloadEncoding: "utf-8";
+  maxSkewSeconds: number;
+  perRequestSecretSupported: boolean;
 }
 
 export async function fetchWebhookTemplates() {
   return apiFetch<WebhookTemplate[]>("/webhooks/templates");
+}
+
+/** Public: reports the wire format receivers should implement, never a secret. */
+export async function fetchWebhookSigningStatus() {
+  return apiFetch<WebhookSigningStatus>("/webhooks/signing");
 }
 
 export async function saveWebhookTemplate(template: WebhookTemplate) {

@@ -29,9 +29,9 @@ SaviTools implements the following security measures:
 
 ### Webhook Security
 
-- **HMAC-SHA256 Signing**: Outbound webhooks are signed when `WEBHOOK_SIGNING_SECRET` is configured
-- **Timestamp Verification**: Replay protection with configurable time window (default 300s)
-- **Signature Header**: `X-SaviTools-Signature` with format `sha256=<hex>`
+- **HMAC-SHA256 Signing**: Outbound webhooks (Webhook Tester, contract-event replay, monitor alerts) are signed with a per-request secret or `WEBHOOK_SIGNING_SECRET`
+- **Timestamp Verification**: The signature covers `<timestamp>.<body>`, so a captured request cannot be replayed verbatim. Reject timestamps older than the replay window (default 300s) or more than 60s in the future
+- **Signature Header**: `X-SaviTools-Signature` with format `sha256=<hex>`, paired with `X-SaviTools-Timestamp` (integer Unix seconds)
 
 ### Authentication
 

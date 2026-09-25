@@ -2,15 +2,128 @@ import { createHmac } from 'crypto';
 import {
   DEFAULT_MAX_AGE_SECONDS,
   DEFAULT_MAX_SKEW_SECONDS,
+  LEGACY_ISO_TIMESTAMP_HEADER,
+  LEGACY_SIGNATURE_HEADER,
   SIGNATURE_HEADER,
   TIMESTAMP_HEADER,
+  isLegacySignedRequest,
   signBody,
+  signatureHeaders,
+  signingStatus,
   verifySignature,
 } from './signature';
 
 const SECRET = 'whsec_test-secret-123';
 const BODY = JSON.stringify({ event: 'campaign.funded', amount: '1000' });
 const TS = 1_700_000_000; // fixed clock for deterministic tests
+
+/**
+ * Known answer, computed independently of the implementation:
+ *   echo -n '1700000000.{"event":"campaign.funded","amount":"1000"}' \
+ *     | openssl dgst -sha256 -hmac 'whsec_test-secret-123'
+ * Every outbound path's spec asserts against this same literal, so a signing
+ * change cannot quietly become a one-path-only change.
+ */
+const KAT_SIGNATURE =
+  'sha256=8fdd9825bcf035086dfda168a689ff2386e1bf78eb255579bc6bbe2fe2ed590a';
+
+describe('known answer', () => {
+  it('matches an independently computed HMAC of `<timestamp>.<body>`', () => {
+    expect(signBody({ secret: SECRET, body: BODY, timestamp: TS })).toEqual({
+      signature: KAT_SIGNATURE,
+      timestamp: String(TS),
+    });
+  });
+
+  it('rejects the legacy body-only signature for the same secret and body', () => {
+    // The pre-timestamped format a receiver used to see. It must not verify,
+    // otherwise a verifier could not tell the two formats apart.
+    const legacy = `sha256=${createHmac('sha256', SECRET).update(BODY).digest('hex')}`;
+
+    expect(legacy).not.toBe(KAT_SIGNATURE);
+    expect(
+      verifySignature({
+        secret: SECRET,
+        body: BODY,
+        signature: legacy,
+        timestamp: String(TS),
+        now: TS,
+      }),
+    ).toEqual({ valid: false, reason: 'invalid-signature' });
+  });
+});
+
+describe('signatureHeaders', () => {
+  it('returns the one documented header pair, and nothing else', () => {
+    expect(signatureHeaders({ secret: SECRET, body: BODY, timestamp: TS })).toEqual({
+      [SIGNATURE_HEADER]: KAT_SIGNATURE,
+      [TIMESTAMP_HEADER]: String(TS),
+    });
+  });
+
+  it('produces headers a receiver can verify from the body it received', () => {
+    const headers = signatureHeaders({ secret: SECRET, body: BODY, timestamp: TS });
+
+    expect(
+      verifySignature({
+        secret: SECRET,
+        body: BODY,
+        signature: headers[SIGNATURE_HEADER],
+        timestamp: headers[TIMESTAMP_HEADER],
+        now: TS,
+      }),
+    ).toEqual({ valid: true });
+  });
+});
+
+describe('isLegacySignedRequest', () => {
+  it('recognises headers recorded under the pre-timestamped format', () => {
+    expect(
+      isLegacySignedRequest({ [LEGACY_SIGNATURE_HEADER]: 'sha256=abc' }),
+    ).toBe(true);
+    expect(
+      isLegacySignedRequest({ [LEGACY_ISO_TIMESTAMP_HEADER]: '2024-01-01T00:00:00Z' }),
+    ).toBe(true);
+    expect(
+      isLegacySignedRequest({ 'x-webhook-signature': 'sha256=abc' }),
+    ).toBe(true);
+  });
+
+  it('leaves current-format and unsigned requests alone', () => {
+    const current = signatureHeaders({ secret: SECRET, body: BODY, timestamp: TS });
+
+    expect(isLegacySignedRequest(current)).toBe(false);
+    expect(isLegacySignedRequest({ 'Content-Type': 'application/json' })).toBe(false);
+    expect(isLegacySignedRequest({})).toBe(false);
+  });
+});
+
+describe('signingStatus', () => {
+  it('describes the timestamped contract, not the legacy body-only format', () => {
+    const status = signingStatus({ enabled: true });
+
+    expect(status).toEqual({
+      enabled: true,
+      algorithm: 'hmac-sha256',
+      signatureHeader: 'X-SaviTools-Signature',
+      timestampHeader: 'X-SaviTools-Timestamp',
+      replayWindowSeconds: DEFAULT_MAX_AGE_SECONDS,
+      signedPayloadFormat: '<timestamp>.<body>',
+      signatureFormat: 'sha256=<hex>',
+      signedPayloadEncoding: 'utf-8',
+      maxSkewSeconds: DEFAULT_MAX_SKEW_SECONDS,
+      perRequestSecretSupported: true,
+    });
+    expect(status.signedPayloadFormat).toContain('timestamp');
+  });
+
+  it('honours an explicit window and reports signing as disabled', () => {
+    expect(signingStatus({ enabled: false })).toMatchObject({ enabled: false });
+    expect(
+      signingStatus({ enabled: true, replayWindowSeconds: 60, maxSkewSeconds: 5 }),
+    ).toMatchObject({ replayWindowSeconds: 60, maxSkewSeconds: 5 });
+  });
+});
 
 describe('signBody', () => {
   it('emits sha256=<64 hex chars> covering `<timestamp>.<body>`', () => {
@@ -216,5 +329,12 @@ describe('header constants', () => {
   it('matches the documented wire format names', () => {
     expect(SIGNATURE_HEADER).toBe('X-SaviTools-Signature');
     expect(TIMESTAMP_HEADER).toBe('X-SaviTools-Timestamp');
+  });
+
+  it('keeps the legacy names recognisable but distinct from the current pair', () => {
+    expect(LEGACY_SIGNATURE_HEADER).toBe('X-Webhook-Signature');
+    expect(LEGACY_ISO_TIMESTAMP_HEADER).toBe('X-Timestamp');
+    expect(LEGACY_SIGNATURE_HEADER).not.toBe(SIGNATURE_HEADER);
+    expect(LEGACY_ISO_TIMESTAMP_HEADER).not.toBe(TIMESTAMP_HEADER);
   });
 });

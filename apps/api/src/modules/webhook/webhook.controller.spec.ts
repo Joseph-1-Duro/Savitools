@@ -12,6 +12,31 @@ describe('WebhookController authorization', () => {
     expect(guardNames(WebhookController.prototype.getTemplates)).toHaveLength(0);
   });
 
+  it('keeps the signing status public: it reports config, never a secret', () => {
+    expect(guardNames(WebhookController.prototype.getSigningStatus)).toHaveLength(0);
+  });
+
+  it('reports the timestamped wire format from the signing status endpoint', () => {
+    const controller = new WebhookController({
+      getSigningStatus: () => ({
+        enabled: true,
+        algorithm: 'hmac-sha256' as const,
+        signatureHeader: 'X-SaviTools-Signature',
+        timestampHeader: 'X-SaviTools-Timestamp',
+        replayWindowSeconds: 300,
+        signedPayloadFormat: '<timestamp>.<body>',
+        signatureFormat: 'sha256=<hex>',
+        signedPayloadEncoding: 'utf-8' as const,
+        maxSkewSeconds: 60,
+        perRequestSecretSupported: true,
+      }),
+    } as never);
+
+    const status = controller.getSigningStatus();
+    expect(status.signedPayloadFormat).toBe('<timestamp>.<body>');
+    expect(JSON.stringify(status)).not.toMatch(/body-only|no timestamp/i);
+  });
+
   it('requires authentication for send, save, history and replay', () => {
     expect(guardNames(WebhookController.prototype.sendWebhook)).toContain('JwtAuthGuard');
     expect(guardNames(WebhookController.prototype.saveTemplate)).toContain('JwtAuthGuard');
