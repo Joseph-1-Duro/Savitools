@@ -10,6 +10,7 @@ import {
 import * as argon2 from 'argon2';
 import { createHash } from 'crypto';
 import { AuthService } from './auth.service';
+import { EncryptionService } from '../../common/encryption.service';
 
 function mockRepo() {
   return {
@@ -146,6 +147,7 @@ describe('AuthService', () => {
       passkeysRepo as any,
       jwt as any,
       config as any,
+      new EncryptionService(config as any),
     );
   });
 
@@ -486,6 +488,7 @@ describe('AuthService', () => {
         passkeysRepo as any,
         jwt as any,
         prodConfig as any,
+        new EncryptionService(prodConfig as any),
       );
 
       const createdUser = { id: 'u-prod', email: 'prod@example.com' };
@@ -524,6 +527,7 @@ describe('AuthService', () => {
         passkeysRepo as any,
         jwt as any,
         prodConfig as any,
+        new EncryptionService(prodConfig as any),
       );
 
       const mockSend = jest.fn().mockRejectedValue(new Error('Resend network outage'));
@@ -573,6 +577,7 @@ describe('AuthService', () => {
         passkeysRepo as any,
         jwt as any,
         prodConfig as any,
+        new EncryptionService(prodConfig as any),
       );
 
       const mockSend = jest.fn().mockResolvedValue({ id: 'msg-1' });
@@ -784,6 +789,7 @@ describe('AuthService', () => {
           passkeysRepo as any,
           jwt as any,
           config as any,
+          new EncryptionService(config as any),
         );
         return { svc, table };
       }
@@ -1133,6 +1139,7 @@ describe('AuthService', () => {
         passkeysRepo as any,
         jwt as any,
         prodConfig as any,
+        new EncryptionService(prodConfig as any),
       );
 
       const redis = redisWithNonce();

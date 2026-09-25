@@ -38,6 +38,7 @@ describe("NotificationWorkerService", () => {
     };
     const webhookRepository = {
       createQueryBuilder: jest.fn().mockReturnValue(queryBuilder),
+      update: jest.fn().mockResolvedValue(undefined),
     } as unknown as Repository<MonitorWebhook>;
     const worker = createWorker(webhookRepository);
     const response = { ok: true, status: 200 } as Response;
@@ -84,6 +85,7 @@ describe("NotificationWorkerService", () => {
           secret: "test-secret-at-least-sixteen",
         }),
       }),
+      update: jest.fn().mockResolvedValue(undefined),
     } as unknown as Repository<MonitorWebhook>;
     const worker = createWorker(webhookRepository);
     const fetchMock = jest.spyOn(global, "fetch");
@@ -108,6 +110,7 @@ describe("NotificationWorkerService", () => {
           secret: "test-secret-at-least-sixteen",
         }),
       }),
+      update: jest.fn().mockResolvedValue(undefined),
     } as unknown as Repository<MonitorWebhook>;
     const worker = createWorker(webhookRepository);
     jest
@@ -168,12 +171,21 @@ function createWorker(
       key === "RESEND_FROM_EMAIL" ? "alerts@example.com" : fallback,
     ),
   } as unknown as ConfigService;
+  const encryptionService = {
+    encryptForUser: jest.fn().mockReturnValue({
+      encrypted: "encrypted",
+      iv: "iv",
+      authTag: "authTag",
+    }),
+    decryptForUser: jest.fn(),
+  };
   return new NotificationWorkerService(
     config,
     {} as Repository<AlertEvent>,
     webhookRepository,
     {} as Repository<User>,
     { emitToUser: jest.fn() } as unknown as MonitorGateway,
+    encryptionService as any,
   );
 }
 

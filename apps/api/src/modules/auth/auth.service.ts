@@ -26,16 +26,10 @@ import type {
   PublicKeyCredentialRequestOptionsJSON,
   RegistrationResponseJSON,
 } from '@simplewebauthn/server';
-import {
-  createCipheriv,
-  createDecipheriv,
-  createHash,
-  hkdfSync,
-  randomBytes,
-  randomUUID,
-} from 'crypto';
+import { createHash, randomBytes, randomUUID } from 'crypto';
 import { Resend } from 'resend';
 import { IsNull, Repository } from 'typeorm';
+import { EncryptionService, ENCRYPTION_PURPOSES } from '../../common/encryption.service';
 import {
   ACCESS_TOKEN_TTL_SECONDS,
   EMAIL_VERIFICATION_TTL_SECONDS,
@@ -74,12 +68,8 @@ export interface IssueSessionContext {
   userAgent?: string;
 }
 
-const AES_ALGORITHM = 'aes-256-gcm';
-const AES_KEY_LENGTH = 32;
-const AES_IV_LENGTH = 16;
-const HKDF_HASH = 'sha256';
-const HKDF_INFO_CONNECTED = 'savitools-connected-account-v1';
-const HKDF_INFO_VAULT = 'savitools-vault-key-v1';
+const HKDF_INFO_CONNECTED = ENCRYPTION_PURPOSES.CONNECTED_ACCOUNT;
+const HKDF_INFO_VAULT = ENCRYPTION_PURPOSES.VAULT_KEY;
 
 @Injectable()
 export class AuthService {
@@ -99,6 +89,7 @@ export class AuthService {
     private readonly passkeysRepository: Repository<PasskeyCredential>,
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
+    private readonly encryptionService: EncryptionService,
   ) {
     const resendKey = this.configService.get<string>('RESEND_API_KEY');
     this.resend = resendKey ? new Resend(resendKey) : null;
@@ -1138,26 +1129,12 @@ export class AuthService {
     return createHash('sha256').update(token).digest('hex');
   }
 
-  /** Derive a per-user AES-256 key using HKDF (master secret + userId as salt) */
-  private deriveUserKey(userId: string, info: string): Buffer {
-    const masterSecret = this.configService.getOrThrow<string>('ENCRYPTION_SECRET');
-    return Buffer.from(
-      hkdfSync(HKDF_HASH, masterSecret, userId, info, AES_KEY_LENGTH),
-    );
-  }
-
   private encryptForUser(
     userId: string,
     plaintext: string,
     info: string,
   ): { encrypted: string; iv: string; authTag: string } {
-    const key = this.deriveUserKey(userId, info);
-    const ivBytes = randomBytes(AES_IV_LENGTH);
-    const cipher = createCipheriv(AES_ALGORITHM, key, ivBytes);
-    let encrypted = cipher.update(plaintext, 'utf8', 'hex');
-    encrypted += cipher.final('hex');
-    const authTag = cipher.getAuthTag().toString('hex');
-    return { encrypted, iv: ivBytes.toString('hex'), authTag };
+    return this.encryptionService.encryptForUser(userId, plaintext, info);
   }
 
   private decryptForUser(
@@ -1167,14 +1144,11 @@ export class AuthService {
     authTagHex: string,
     info: string,
   ): string {
-    const key = this.deriveUserKey(userId, info);
-    const iv = Buffer.from(ivHex, 'hex');
-    const authTag = Buffer.from(authTagHex, 'hex');
-    const decipher = createDecipheriv(AES_ALGORITHM, key, iv);
-    decipher.setAuthTag(authTag);
-    let decrypted = decipher.update(encrypted, 'hex', 'utf8');
-    decrypted += decipher.final('utf8');
-    return decrypted;
+    return this.encryptionService.decryptForUser(
+      userId,
+      { encrypted, iv: ivHex, authTag: authTagHex },
+      info,
+    );
   }
 
   private async sendVerificationEmail(

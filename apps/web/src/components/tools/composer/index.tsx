@@ -128,7 +128,7 @@ function SequenceRunner({
     for (let i = 0; i < allSteps.length; i++) {
       const ops = allSteps[i];
       try {
-        const apiNetwork = network === 'mainnet' ? 'mainnet' : 'testnet';
+        const apiNetwork: 'testnet' | 'mainnet' = network === 'mainnet' ? 'mainnet' : 'testnet';
         const payload = {
           sourceAccount: currentSource.trim(),
           memo: memo.trim() || undefined,
@@ -312,7 +312,7 @@ export function ComposerTool() {
           memo: mem.trim() || undefined,
           operations: ops.map((op) => ({ type: op.type, ...op.fields })),
           preconditions: precondition ? [precondition] : undefined,
-          network: network === 'mainnet' ? 'mainnet' : 'testnet',
+          network: (network === 'mainnet' ? 'mainnet' : 'testnet') as 'testnet' | 'mainnet',
         };
         const built = await buildTransaction(payload);
         setXdr(built.xdr);
@@ -570,7 +570,7 @@ export function ComposerTool() {
     try {
       const result = await simulateTransaction({
         xdr,
-        network: network === 'mainnet' ? 'mainnet' : 'testnet',
+        network: (network === 'mainnet' ? 'mainnet' : 'testnet') as 'testnet' | 'mainnet',
       });
       setSimResult(result);
       addRecentItem({

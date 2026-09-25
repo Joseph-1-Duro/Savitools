@@ -28,6 +28,7 @@ import {
   NotificationJobData,
 } from './monitor.types';
 import { MonitorGateway } from './monitor.gateway';
+import { EncryptionService, ENCRYPTION_PURPOSES } from '../../common/encryption.service';
 
 const REDIRECT_STATUS_CODES = new Set([301, 302, 303, 307, 308]);
 
@@ -48,6 +49,7 @@ export class NotificationWorkerService
     @InjectRepository(User)
     private readonly userRepository: Repository<User>,
     private readonly gateway: MonitorGateway,
+    private readonly encryptionService: EncryptionService,
   ) {}
 
   onModuleInit(): void {
@@ -208,13 +210,15 @@ export class NotificationWorkerService
   ): Promise<void> {
     const webhook = await this.webhookRepository
       .createQueryBuilder('webhook')
-      .addSelect('webhook.secret')
+      .addSelect(['webhook.secret', 'webhook.iv', 'webhook.authTag'])
       .where('webhook.user_id = :userId', { userId })
       .andWhere('webhook.enabled = true')
       .getOne();
     if (!webhook) {
       throw new Error('No monitor webhook is configured');
     }
+
+    const secret = await this.decryptAndUpgradeSecret(userId, webhook);
 
     const destination = new URL(webhook.url);
     await assertSafeWebhookDestination(destination);
@@ -227,7 +231,7 @@ export class NotificationWorkerService
     });
     // Same timestamped wire format as WebhookService and event replay.
     const { signature, timestamp } = signBody({
-      secret: webhook.secret,
+      secret,
       body,
     });
     let currentUrl = destination;
@@ -285,5 +289,38 @@ export class NotificationWorkerService
       .replaceAll('>', '&gt;')
       .replaceAll('"', '&quot;')
       .replaceAll("'", '&#039;');
+  }
+
+  /**
+   * Decrypt a webhook secret, transparently re-encrypting it under the
+   * per-user AES-256-GCM scheme if it is still stored as legacy plaintext.
+   * Idempotent: once a row is `secretVersion: 2` this is a no-op read.
+   */
+  private async decryptAndUpgradeSecret(
+    userId: string,
+    webhook: MonitorWebhook,
+  ): Promise<string> {
+    if (webhook.secretVersion === 2 && webhook.iv && webhook.authTag) {
+      return this.encryptionService.decryptForUser(
+        userId,
+        { encrypted: webhook.secret, iv: webhook.iv, authTag: webhook.authTag },
+        ENCRYPTION_PURPOSES.MONITOR_WEBHOOK_SECRET,
+      );
+    }
+
+    const plaintext = webhook.secret;
+    const upgraded = this.encryptionService.encryptForUser(
+      userId,
+      plaintext,
+      ENCRYPTION_PURPOSES.MONITOR_WEBHOOK_SECRET,
+    );
+    await this.webhookRepository.update(webhook.id, {
+      secret: upgraded.encrypted,
+      iv: upgraded.iv,
+      authTag: upgraded.authTag,
+      secretVersion: 2,
+    });
+
+    return plaintext;
   }
 }

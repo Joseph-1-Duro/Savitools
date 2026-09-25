@@ -71,11 +71,17 @@ describe('PlaygroundService#proxyRequest SSRF protections', () => {
 
     const authService = { resolveKey: jest.fn().mockResolvedValue('sk_live_secret') };
 
+    const encryptionService = {
+      encryptForUser: jest.fn(),
+      decryptForUser: jest.fn(),
+    };
+
     service = new PlaygroundService(
       apiKeysRepository as any,
       historyRepository as any,
       configService as any,
       authService as any,
+      encryptionService as any,
     );
 
     originalFetch = global.fetch;
@@ -231,5 +237,111 @@ describe('PlaygroundService#proxyRequest SSRF protections', () => {
     ).rejects.toThrow(BadGatewayException);
 
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('PlaygroundService key encryption migration (Savitura/Savitools#206)', () => {
+  it('re-encrypts a legacy (keyVersion: 1) row under the new per-user scheme on first read, idempotently', async () => {
+    const legacyRecord = {
+      id: 'key-1',
+      userId: 'user-1',
+      encryptedKey: 'legacy-ciphertext',
+      iv: 'legacy-iv',
+      authTag: 'legacy-auth-tag',
+      keyVersion: 1,
+    };
+
+    const apiKeysRepository = {
+      findOne: jest.fn().mockResolvedValue(legacyRecord),
+      find: jest.fn().mockResolvedValue([legacyRecord]),
+      update: jest.fn().mockResolvedValue(undefined),
+    };
+    const historyRepository = { create: jest.fn(), save: jest.fn() };
+    const configService = {
+      get: jest.fn().mockReturnValue('https://api.provider.com'),
+      getOrThrow: jest.fn().mockReturnValue('jwt-secret-for-legacy-decrypt'),
+    };
+    const authService = { resolveKey: jest.fn() };
+    const encryptionService = {
+      encryptForUser: jest.fn().mockReturnValue({
+        encrypted: 'v2-ciphertext',
+        iv: 'v2-iv',
+        authTag: 'v2-auth-tag',
+      }),
+      decryptForUser: jest.fn(),
+    };
+
+    const service = new PlaygroundService(
+      apiKeysRepository as any,
+      historyRepository as any,
+      configService as any,
+      authService as any,
+      encryptionService as any,
+    );
+
+    // legacyDecrypt would normally need a real AES-GCM ciphertext; stub it
+    // out so this test focuses purely on the version-detection/upgrade path.
+    (service as any).legacyDecrypt = jest.fn().mockReturnValue('plaintext-api-key');
+
+    const keys = await service.listKeys('user-1');
+
+    expect(keys[0].maskedKey).toBe('plaintext-api-key'.slice(0, 8) + '...' + 'plaintext-api-key'.slice(-4));
+    // The legacy scheme never sees EncryptionService for decryption.
+    expect(encryptionService.decryptForUser).not.toHaveBeenCalled();
+    // Upgrade path re-encrypts once under the new per-user scheme...
+    expect(encryptionService.encryptForUser).toHaveBeenCalledWith(
+      'user-1',
+      'plaintext-api-key',
+      expect.any(String),
+    );
+    // ...and persists it as keyVersion 2, so a retry of the migration is a no-op read.
+    expect(apiKeysRepository.update).toHaveBeenCalledWith('key-1', {
+      encryptedKey: 'v2-ciphertext',
+      iv: 'v2-iv',
+      authTag: 'v2-auth-tag',
+      keyVersion: 2,
+    });
+  });
+
+  it('reads an already-upgraded (keyVersion: 2) row without touching the legacy decrypt path or re-writing it', async () => {
+    const upgradedRecord = {
+      id: 'key-2',
+      userId: 'user-1',
+      encryptedKey: 'v2-ciphertext',
+      iv: 'v2-iv',
+      authTag: 'v2-auth-tag',
+      keyVersion: 2,
+    };
+
+    const apiKeysRepository = {
+      find: jest.fn().mockResolvedValue([upgradedRecord]),
+      update: jest.fn(),
+    };
+    const historyRepository = { create: jest.fn(), save: jest.fn() };
+    const configService = { get: jest.fn(), getOrThrow: jest.fn() };
+    const authService = { resolveKey: jest.fn() };
+    const encryptionService = {
+      encryptForUser: jest.fn(),
+      decryptForUser: jest.fn().mockReturnValue('plaintext-api-key'),
+    };
+
+    const service = new PlaygroundService(
+      apiKeysRepository as any,
+      historyRepository as any,
+      configService as any,
+      authService as any,
+      encryptionService as any,
+    );
+
+    const keys = await service.listKeys('user-1');
+
+    expect(keys[0].maskedKey).toContain('plai');
+    expect(encryptionService.decryptForUser).toHaveBeenCalledWith(
+      'user-1',
+      { encrypted: 'v2-ciphertext', iv: 'v2-iv', authTag: 'v2-auth-tag' },
+      expect.any(String),
+    );
+    expect(encryptionService.encryptForUser).not.toHaveBeenCalled();
+    expect(apiKeysRepository.update).not.toHaveBeenCalled();
   });
 });

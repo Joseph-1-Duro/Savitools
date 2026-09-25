@@ -36,6 +36,7 @@ describe('MonitorService', () => {
       registry,
       streamManager,
       {} as MonitorQueueService,
+      {} as any,
     );
 
     await service.deleteWatch('user-one', 'watch-one');
@@ -76,6 +77,7 @@ describe('MonitorService', () => {
       registry,
       streamManager,
       {} as MonitorQueueService,
+      {} as any,
     );
 
     const created = await service.createWatch('user-two', {

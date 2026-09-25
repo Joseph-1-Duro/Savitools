@@ -21,6 +21,7 @@ import { AddAuthEnhancements1785398400000 } from './migrations/1785398400000-add
 import { CreateTransactionReplay1785700000000 } from './migrations/1785700000000-create-transaction-replay';
 import { CreateNetworkSamples1785786400000 } from './migrations/1785786400000-create-network-samples';
 import { CreatePasskeys1786200000000 } from './migrations/1786200000000-create-passkeys';
+import { AddSecretEncryptionVersioning1786300000000 } from './migrations/1786300000000-add-secret-encryption-versioning';
 
 export default new DataSource({
   type: 'postgres',
@@ -49,6 +50,7 @@ export default new DataSource({
     CreateTransactionReplay1785700000000,
     CreateNetworkSamples1785786400000,
     CreatePasskeys1786200000000,
+    AddSecretEncryptionVersioning1786300000000,
   ],
   synchronize: false,
 });

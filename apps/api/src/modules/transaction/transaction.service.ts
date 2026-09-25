@@ -96,27 +96,6 @@ export class TransactionService {
       };
     }
 
-    let submitted = false;
-    let submittedHash: string | null = null;
-    let submissionResult: any = null;
-
-    if (dto.submit && dto.secretKey) {
-      try {
-        const keypair = StellarSdk.Keypair.fromSecret(dto.secretKey);
-        transaction.sign(keypair);
-        const signedEnvelope = transaction.toEnvelope().toXDR('base64');
-        const submitRes = await server.submitTransaction(transaction);
-        submitted = true;
-        submittedHash = submitRes.hash;
-        submissionResult = submitRes;
-      } catch (e: any) {
-        submissionResult = {
-          success: false,
-          error: e?.response?.data ?? e.message,
-        };
-      }
-    }
-
     const replayRecord = this.replayRepository.create({
       userId,
       network,
@@ -126,9 +105,9 @@ export class TransactionService {
       modifiedXdr,
       modifications: mods,
       simulationResult,
-      submitted,
-      submittedHash,
-      submissionResult,
+      submitted: false,
+      submittedHash: null,
+      submissionResult: null,
     });
 
     const saved = await this.replayRepository.save(replayRecord);
@@ -142,9 +121,8 @@ export class TransactionService {
       modifiedXdr,
       modifications: mods,
       simulationResult,
-      submitted,
-      submittedHash,
-      submissionResult,
+      submitted: false,
+      submittedHash: null,
       createdAt: saved.createdAt,
     };
   }

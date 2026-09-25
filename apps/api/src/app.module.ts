@@ -29,7 +29,9 @@ import { AddAuthEnhancements1785398400000 } from "./database/migrations/17853984
 import { CreateGraphSnapshots1785600000000 } from "./database/migrations/1785600000000-create-graph-snapshots";
 import { CreateNetworkSamples1785786400000 } from "./database/migrations/1785786400000-create-network-samples";
 import { AddPasswordReset1786100000000 } from "./database/migrations/1786100000000-add-password-reset";
+import { AddSecretEncryptionVersioning1786300000000 } from "./database/migrations/1786300000000-add-secret-encryption-versioning";
 import { validateEnvironment } from "./config/env-validation";
+import { CommonModule } from "./common/common.module";
 
 @Module({
   imports: [
@@ -64,12 +66,14 @@ ThrottlerModule.forRootAsync({
           CreateGraphSnapshots1785600000000,
           CreateNetworkSamples1785786400000,
           AddPasswordReset1786100000000,
+          AddSecretEncryptionVersioning1786300000000,
         ],
         migrationsRun: config.get<string>("RUN_MIGRATIONS") === "true",
         logging: config.get<string>("NODE_ENV") === "development",
       }),
     }),
 
+    CommonModule,
     AuthModule,
     StellarTestnetModule,
     PlaygroundModule,
