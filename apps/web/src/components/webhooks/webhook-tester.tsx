@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { addRecentItem } from '@/lib/recent-items';
 import { useCommandPalette, ShortcutBadge } from '@/components/command-palette';
 import {
@@ -20,13 +20,23 @@ import {
 import { cn } from '@/lib/utils';
 import {
   fetchWebhookTemplates,
+  fetchWebhookSigningStatus,
   saveWebhookTemplate,
   sendWebhook,
   fetchWebhookHistory,
   replayWebhook,
   type WebhookTemplate,
   type WebhookHistoryEntry,
+  type WebhookSigningStatus,
 } from '@/lib/api';
+import {
+  SIGNATURE_HEADER,
+  TIMESTAMP_HEADER,
+  canonicalRequestBody,
+  nowSeconds,
+  signPayload,
+  signedPayload,
+} from '@/lib/webhook-signature';
 
 function formatJson(data: unknown): string {
   try {
@@ -56,6 +66,24 @@ function getStatusColor(status?: number | null): string {
   return 'bg-red-500/15 text-red-400 border-red-500/30';
 }
 
+function escapeForSingleQuotes(value: string): string {
+  return value.replace(/'/g, "'\\''");
+}
+
+/**
+ * Renders a copy-pasteable reproduction of a delivery. Uses the exact body
+ * bytes the API signed (not a fresh `JSON.stringify`) so the command a receiver
+ * runs verifies against the signature the API sent.
+ */
+function curlFor(entry: WebhookHistoryEntry): string {
+  const body = entry.signature?.body ?? JSON.stringify(entry.payload);
+  return `curl -s -X ${entry.method || 'POST'} '${entry.endpointUrl}' \
+  ${Object.entries(entry.requestHeaders)
+    .map(([k, v]) => `-H '${k}: ${v}'`)
+    .join(' \
+  ')} \
+  -d '${escapeForSingleQuotes(body)}'`;
+}
 
 function CopyButton({ text, label }: { text: string; label: string }) {
   const [copied, setCopied] = useState(false);
@@ -94,8 +122,11 @@ export function WebhookTester() {
   const [payloadValid, setPayloadValid] = useState(true);
   const [schemaError, setSchemaError] = useState<string | null>(null);
   const [secret, setSecret] = useState('');
-  const [signature, setSignature] = useState('');
-  const [signatureTimestamp, setSignatureTimestamp] = useState('');
+  const [localSignature, setLocalSignature] = useState<string | null>(null);
+  const [signingStatus, setSigningStatus] = useState<WebhookSigningStatus | null>(null);
+  // Ticks once a second so the previewed timestamp stays the one a send would
+  // use right now, instead of freezing on the value from when it was typed.
+  const [clockSecond, setClockSecond] = useState(() => nowSeconds());
 
   const [customHeaders, setCustomHeaders] = useState<Array<{ name: string; value: string }>>([]);
   const [repeatCount, setRepeatCount] = useState<number>(1);
@@ -182,32 +213,73 @@ export function WebhookTester() {
   }, [payloadEditor]);
 
   useEffect(() => {
-    if (!secret || !payloadValid) {
-      setSignature('');
-      setSignatureTimestamp('');
+    void fetchWebhookSigningStatus()
+      .then(setSigningStatus)
+      .catch(() => setSigningStatus(null));
+  }, []);
+
+  useEffect(() => {
+    const timer = setInterval(() => setClockSecond(nowSeconds()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  /**
+   * The bytes the API signs: the parsed payload, serialised compactly — not the
+   * pretty-printed text in the editor. While the editor still holds the
+   * delivered payload we reuse the exact timestamp and body the API reported, so
+   * the panel shows the value that actually went on the wire; once the payload
+   * changes it falls back to the timestamp a send right now would use.
+   */
+  const signingInput = useMemo(() => {
+    if (!payloadValid || !payloadEditor.trim()) return null;
+
+    let editorBody: string;
+    try {
+      editorBody = canonicalRequestBody(JSON.parse(payloadEditor));
+    } catch {
+      return null;
+    }
+
+    if (result?.signature && result.signature.body === editorBody) {
+      return {
+        timestamp: result.signature.timestamp,
+        body: result.signature.body,
+        fromDelivery: true,
+      };
+    }
+
+    return { timestamp: String(clockSecond), body: editorBody, fromDelivery: false };
+  }, [result, payloadEditor, payloadValid, clockSecond]);
+
+  const signedBytes = signingInput
+    ? signedPayload(signingInput.timestamp, signingInput.body)
+    : null;
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!secret || !signingInput) {
+      setLocalSignature(null);
       return;
     }
-    try {
-      // Mirror the API's wire format: sign `<timestamp>.<body>` and carry the
-      // Unix-second timestamp alongside the signature.
-      const timestamp = Math.floor(Date.now() / 1000);
-      const payloadBytes = new TextEncoder().encode(`${timestamp}.${payloadEditor}`);
-      const keyBytes = new TextEncoder().encode(secret);
-      crypto.subtle
-        .importKey('raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
-        .then((key) => crypto.subtle.sign('HMAC', key, payloadBytes))
-        .then((sig) => {
-          const hex = Array.from(new Uint8Array(sig))
-            .map((b) => b.toString(16).padStart(2, '0'))
-            .join('');
-          setSignature(hex);
-        })
-        .catch(() => setSignature(''));
-    } catch {
-      setSignature('');
-      setSignatureTimestamp('');
-    }
-  }, [secret, payloadEditor, payloadValid]);
+    void signPayload(secret, signingInput.timestamp, signingInput.body).then(
+      (value) => {
+        if (!cancelled) setLocalSignature(value);
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [secret, signingInput]);
+
+  // A delivery is only trustworthy if this browser reproduces the API's
+  // signature from the same timestamp and bytes, so say so explicitly. Only
+  // meaningful once a signature was actually computed for the delivered input.
+  const reproducesDelivery =
+    !!result?.signature &&
+    signingInput?.fromDelivery === true &&
+    localSignature !== null;
+  const localMatchesApi =
+    reproducesDelivery && localSignature === result!.signature!.signature;
 
   useEffect(() => {
     function handleClickOutside(e: MouseEvent) {
@@ -480,7 +552,23 @@ export function WebhookTester() {
           <h3 className="text-sm font-semibold text-foreground flex items-center gap-2">
             <Clock className="h-4 w-4 text-primary" /> Headers & Signature Verification
           </h3>
-          
+
+          {signingStatus && (
+            <p className="text-[11px] text-muted-foreground">
+              Deployment signing is{' '}
+              <span className={signingStatus.enabled ? 'text-emerald-400' : 'text-amber-400'}>
+                {signingStatus.enabled ? 'enabled' : 'disabled'}
+              </span>{' '}
+              — every signed request carries{' '}
+              <span className="font-mono text-foreground">{signingStatus.signatureHeader}</span>{' '}
+              and{' '}
+              <span className="font-mono text-foreground">{signingStatus.timestampHeader}</span>
+              , and the signature covers{' '}
+              <span className="font-mono text-foreground">{signingStatus.signedPayloadFormat}</span>
+              . Reject timestamps older than {signingStatus.replayWindowSeconds}s.
+            </p>
+          )}
+
           <div className="space-y-3">
             <div>
               <label className="block text-xs font-medium text-muted-foreground mb-1">
@@ -490,15 +578,72 @@ export function WebhookTester() {
                 type="password"
                 value={secret}
                 onChange={(e) => setSecret(e.target.value)}
-                placeholder="Enter shared secret to auto-generate X-Webhook-Signature"
+                placeholder={`Enter shared secret to generate ${SIGNATURE_HEADER}`}
                 className="w-full rounded-md border border-input bg-background px-3 py-2 text-xs font-mono"
               />
-              {signature && (
-                <p className="text-[11px] font-mono text-muted-foreground mt-1 truncate">
-                  Computed Signature: <span className="text-foreground">sha256={signature}</span>
-                </p>
-              )}
             </div>
+
+            {secret && (
+              <div className="space-y-2 rounded border border-border bg-muted/20 p-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] font-medium text-muted-foreground">
+                    {signingInput?.fromDelivery
+                      ? 'Signed bytes used for the last delivery'
+                      : 'Bytes that will be signed on send'}
+                  </span>
+                  {signedBytes && <CopyButton text={signedBytes} label="Copy Bytes" />}
+                </div>
+
+                <dl className="space-y-1.5 text-[11px] font-mono">
+                  <div className="flex items-start gap-2">
+                    <dt className="shrink-0 text-muted-foreground">{TIMESTAMP_HEADER}</dt>
+                    <dd className="text-foreground break-all">
+                      {signingInput?.timestamp ?? '—'}
+                      {signingInput?.fromDelivery
+                        ? ' (as sent)'
+                        : ' (current second)'}
+                    </dd>
+                  </div>
+                  <div className="flex items-start gap-2">
+                    <dt className="shrink-0 text-muted-foreground">Signed payload</dt>
+                    <dd className="text-foreground/80 break-all line-clamp-2">
+                      {signedBytes ?? '—'}
+                    </dd>
+                  </div>
+                  <div className="flex items-start gap-2">
+                    <dt className="shrink-0 text-muted-foreground">{SIGNATURE_HEADER}</dt>
+                    <dd className="text-foreground break-all">
+                      {localSignature ?? '—'}
+                    </dd>
+                  </div>
+                </dl>
+
+                {signingInput && localSignature === null && (
+                  <p className="text-[11px] text-amber-400">
+                    Could not compute the signature here. It is still signed server-side —
+                    check the last delivery below for the value that went on the wire.
+                  </p>
+                )}
+
+                {reproducesDelivery && (
+                  <p
+                    className={cn(
+                      'text-[11px] flex items-center gap-1.5',
+                      localMatchesApi ? 'text-emerald-400' : 'text-amber-400',
+                    )}
+                  >
+                    {localMatchesApi ? (
+                      <CheckCircle className="h-3 w-3 shrink-0" />
+                    ) : (
+                      <AlertTriangle className="h-3 w-3 shrink-0" />
+                    )}
+                    {localMatchesApi
+                      ? `This browser reproduced the API's signature for timestamp ${result!.signature!.timestamp}`
+                      : 'This browser could not reproduce the API signature for the last delivery'}
+                  </p>
+                )}
+              </div>
+            )}
 
             <div className="space-y-2">
               <div className="flex items-center justify-between">
@@ -643,6 +788,24 @@ export function WebhookTester() {
                 <span>{formatTime(result.timestamp)}</span>
               </div>
 
+              {result.legacySignature ? (
+                <p className="rounded border border-amber-500/30 bg-amber-500/10 p-2.5 text-[11px] text-amber-400 flex items-start gap-1.5">
+                  <AlertTriangle className="h-3 w-3 mt-0.5 shrink-0" />
+                  <span>
+                    Recorded before the timestamped signing contract, so it carries the
+                    legacy body-only signature. Replaying it re-signs under{' '}
+                    <span className="font-mono">{SIGNATURE_HEADER}</span> +{' '}
+                    <span className="font-mono">{TIMESTAMP_HEADER}</span>; a receiver
+                    cannot verify this entry as it was sent.
+                  </span>
+                </p>
+              ) : result.signature ? (
+                <p className="rounded border border-border bg-muted/30 p-2.5 text-[11px] font-mono text-muted-foreground">
+                  Signed with <span className="text-foreground">{TIMESTAMP_HEADER}: {result.signature.timestamp}</span>{' '}
+                  over <span className="text-foreground">{SIGNATURE_HEADER}: {result.signature.signature}</span>
+                </p>
+              ) : null}
+
               {/* Response Headers */}
               <div>
                 <h4 className="text-xs font-medium text-muted-foreground mb-1">
@@ -673,22 +836,12 @@ export function WebhookTester() {
                     Request cURL
                   </h4>
                   <CopyButton
-                    text={`curl -s -X ${result.method || 'POST'} '${result.endpointUrl}' \
-  ${Object.entries(result.requestHeaders)
-    .map(([k, v]) => `-H '${k}: ${v}'`)
-    .join(' \
-  ')} \
-  -d '${JSON.stringify(result.payload).replace(/'/g, "'\\''")}'`}
+                    text={curlFor(result)}
                     label="Copy cURL"
                   />
                 </div>
                 <pre className="rounded border border-border bg-muted/30 p-3 text-[11px] font-mono overflow-x-auto max-h-40">
-                  {`curl -s -X ${result.method || 'POST'} '${result.endpointUrl}' \
-  ${Object.entries(result.requestHeaders)
-    .map(([k, v]) => `-H '${k}: ${v}'`)
-    .join(' \
-  ')} \
-  -d '${JSON.stringify(result.payload).replace(/'/g, "'\\''")}'`}
+                  {curlFor(result)}
                 </pre>
               </div>
             </div>
@@ -742,6 +895,14 @@ export function WebhookTester() {
                       <span className="font-mono font-medium truncate">
                         {item.eventType}
                       </span>
+                      {item.legacySignature && (
+                        <span
+                          title="Signed with the legacy body-only format; a replay is re-signed"
+                          className="shrink-0 rounded border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-400"
+                        >
+                          legacy
+                        </span>
+                      )}
                     </div>
                     <div className="text-[11px] text-muted-foreground truncate mt-0.5">
                       {item.endpointUrl}

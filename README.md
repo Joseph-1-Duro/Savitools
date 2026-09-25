@@ -146,32 +146,59 @@ SaviTools protects its REST APIs and WebSocket connections by restricting allowe
 
 ### Webhook Signature Verification
 
-Outbound webhooks (the Webhook Tester, contract-event replay, and monitor alerts) are signed
-with timestamped HMAC-SHA256 whenever a signing secret is in play — the per-request secret if
-you send one, otherwise `WEBHOOK_SIGNING_SECRET`. Check whether signing is enabled on your
-deployment:
+Every outbound delivery — the Webhook Tester, contract-event replay, and monitor alerts —
+uses one signing contract, so a single receiver implementation verifies all of them. Each
+delivery is signed whenever a signing secret is in play: the per-request secret if you send
+one, otherwise `WEBHOOK_SIGNING_SECRET`. Check what your deployment emits:
 
 ```bash
 curl http://localhost:3001/api/webhooks/signing
 # => {"enabled":true,"algorithm":"hmac-sha256","signatureHeader":"X-SaviTools-Signature",
-#     "timestampHeader":"X-SaviTools-Timestamp","replayWindowSeconds":300}
+#     "timestampHeader":"X-SaviTools-Timestamp","replayWindowSeconds":300,
+#     "signedPayloadFormat":"<timestamp>.<body>","signatureFormat":"sha256=<hex>",
+#     "signedPayloadEncoding":"utf-8","maxSkewSeconds":60,
+#     "perRequestSecretSupported":true}
 ```
 
-Every signed request carries two headers:
+Every signed request carries two headers, and nothing else:
 
 - `X-SaviTools-Timestamp`: the Unix time in seconds when the request was built
 - `X-SaviTools-Signature`: `sha256=<hex>`, where the hex is HMAC-SHA256 of the UTF-8 bytes
   of `<timestamp>.<body>` — the exact request body as sent
 
+```bash
+# Reference verification, straight from the wire.
+printf '%s.%s' "$X_SAVITOOLS_TIMESTAMP" "$BODY_BYTES" \
+  | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET"
+# compare to the X-SaviTools-Signature value, in constant time
+```
+
 To verify a signature, recompute the HMAC with your secret over the timestamp and body you
 received, compare it in constant time, and reject requests whose timestamp is older than
-`replayWindowSeconds` (300 s) or implausibly far in the future. The API exposes this exact
-logic as a testable utility: `apps/api/src/modules/webhook/signature.ts`
+`replayWindowSeconds` (300 s) or more than `maxSkewSeconds` (60 s) in the future. The API
+exposes this exact logic as a testable utility: `apps/api/src/modules/webhook/signature.ts`
 (`signBody` / `verifySignature`). A request whose timestamp is older than the replay window
 should be rejected as a potential replay.
 
 > If signing is not enabled (`enabled: false`), webhook payloads are sent unsigned — set
-> `WEBHOOK_SIGNING_SECRET` before pointing receivers at your deployment.
+> `WEBHOOK_SIGNING_SECRET` before pointing receivers at your deployment. Monitor alerts always
+> sign with the per-webhook secret stored for that monitor, never the env var.
+
+#### Migrating from the legacy body-only signature
+
+Earlier builds signed the Webhook Tester's body alone and labelled the result
+`X-Webhook-Signature`, alongside an ISO-8601 `X-Timestamp`. That format has no timestamp
+inside the MAC, so a captured request could be replayed verbatim, and it does not verify
+against the contract above. If you still receive either legacy header:
+
+- **Receivers** must implement the timestamped pair. To keep accepting old deliveries during a
+  rollout, try the timestamped verification first and fall back to the body-only HMAC only
+  when `X-SaviTools-Timestamp` is absent — then stop, since a request carrying a timestamp
+  but failing the timestamped check is a forgery, not a legacy delivery.
+- **Senders** do not need to do anything: all three paths emit the new pair, and the old
+  headers are no longer produced. Replaying a delivery recorded under the old format strips
+  the stale headers and re-signs it under the current contract, and the Webhook Tester marks
+  those history entries `legacy` so it is clear the replay no longer matches the original.
 
 ### 3. Start infrastructure
 

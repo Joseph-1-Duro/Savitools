@@ -13,13 +13,6 @@
    carries the original base64 for anyone who needs the bytes.
 
 3. **Replay signs each event as its own POST**, matching the issue's "sends each event as
-   a POST" — not one batched payload. The wire format matches the rest of the repo:
-   `X-SaviTools-Signature: sha256=<hex>`, HMAC-SHA256 over the exact request body, no
-   timestamp prefix.
-
-4. **Replay's HMAC secret is caller-supplied per request**, mirroring `SendWebhookDto.secret`.
-   Webhook signing is not yet implemented — `WEBHOOK_SIGNING_SECRET` was documented in `.env.example` and the README but was read by
-   nothing in the codebase, so it was deliberately not wired in here.
    a POST" — not one batched payload. The wire format matches the rest of the repo
    (Webhook Tester, event replay, and monitor alerts share `apps/api/src/modules/webhook/signature.ts`):
    `X-SaviTools-Signature: sha256=<hex>` plus `X-SaviTools-Timestamp: <unix seconds>`, where
@@ -58,8 +51,42 @@
    pre-existing gap.
 
 10. **Decoder validation used constructed ScVal fixtures, not a deployed fixture contract.**
-    The acceptance criterion asks for "a contract that emits one event of each type in a
-    test transaction", which would require deploying and funding from CI. In-process
-    fixtures exercise the identical decode path deterministically and offline. This was
+     The acceptance criterion asks for "a contract that emits one event of each type in a
+     test transaction", which would require deploying and funding from CI. In-process
+     fixtures exercise the identical decode path deterministically and offline. This was
     additionally validated against live testnet: 200 real events decoded in 451 ms with
     zero decode failures.
+
+
+## Unified outbound signing contract (issue #204)
+
+11. **The Webhook Tester signed a different payload than it sent.** It signed
+    `dto.payload` re-serialised as `<body>`, but the body handed to `fetch` came from the
+    pretty-printed editor text, so the bytes a receiver verified were not the bytes it
+    received. The signed value is now the single `body` string that goes on the wire, and
+    `WebhookHistoryEntry.signature` reports that exact body plus the timestamp so the UI and
+    any receiver can recompute the same HMAC without re-deriving the serialisation.
+
+12. **The legacy `X-Timestamp` ISO header was dropped rather than kept alongside the signing
+    timestamp.** Two timestamps on one request, in different formats, is how a receiver ends
+    up checking the wrong one. The signing timestamp in `X-SaviTools-Timestamp` is
+    authoritative; `WebhookHistoryEntry.timestamp` still records the local send time for the
+    UI's own display.
+
+13. **Replaying a recorded delivery re-signs rather than replaying its headers.** Recorded
+    secret-shaped headers are already redacted, so a stored signature can never be
+    reproduced; the legacy pair and any stale `X-SaviTools-Timestamp` are stripped and the
+    delivery is signed afresh with the deployment-wide secret. Entries recorded under the
+    body-only format are flagged `legacySignature` on read so the UI can say the replay no
+    longer matches the original bytes.
+
+14. **`GET /webhooks/signing` is public.** It returns configuration and the wire format, never
+    a secret, so a receiver can confirm the contract before traffic is pointed at the
+    deployment. The README and API reference already documented this endpoint before it
+    existed; it is implemented here.
+
+15. **The browser re-implements the contract in `apps/web/src/lib/webhook-signature.ts`.** The
+    Webhook Tester must reproduce the API's bytes to be useful as a verification aid, and it
+    cannot import API code. Both sides assert the same known-answer vector, so a divergence
+    fails one of the two suites rather than surfacing as a signature that only the UI believes.
+

@@ -1024,7 +1024,12 @@ curl http://localhost:3001/api/v1/webhooks/signing
   "algorithm": "hmac-sha256",
   "signatureHeader": "X-SaviTools-Signature",
   "timestampHeader": "X-SaviTools-Timestamp",
-  "replayWindowSeconds": 300
+  "replayWindowSeconds": 300,
+  "signedPayloadFormat": "<timestamp>.<body>",
+  "signatureFormat": "sha256=<hex>",
+  "signedPayloadEncoding": "utf-8",
+  "maxSkewSeconds": 60,
+  "perRequestSecretSupported": true
 }
 ```
 
@@ -1034,84 +1039,121 @@ request carries `X-SaviTools-Timestamp: <unix seconds>` and
 `X-SaviTools-Signature: sha256=<hex>`, where the hex is HMAC-SHA256 over the UTF-8 bytes of
 `<timestamp>.<body>` with the exact body bytes sent. Receivers should recompute that HMAC with
 the shared secret, compare in constant time, and reject signatures whose timestamp is older
-than `replayWindowSeconds` (replay) or far in the future (clock skew). The reference
-implementation lives in `apps/api/src/modules/webhook/signature.ts` (`signBody` /
+than `replayWindowSeconds` (replay) or more than `maxSkewSeconds` in the future (clock skew).
+The reference implementation lives in `apps/api/src/modules/webhook/signature.ts` (`signBody` /
 `verifySignature`).
+
+There is no body-only signature format. Deliveries recorded before the timestamped contract
+landed carry the legacy `X-Webhook-Signature`; replaying such an entry strips the stale headers
+and re-signs it, and the history entry is returned with `"legacySignature": true`.
 
 ---
 
 #### POST `/webhooks/send`
 
-Send a webhook payload to a target endpoint.
+Send a webhook payload to a target endpoint. Requires authentication.
 
 **Request:**
 ```bash
 curl -X POST http://localhost:3001/api/v1/webhooks/send \
   -H "Content-Type: application/json" \
+  --cookie "savitools_access_token=YOUR_ACCESS_TOKEN" \
   -d '{
-    "url": "https://example.com/webhook",
+    "endpointUrl": "https://example.com/webhook",
     "eventType": "transaction.submitted",
-    "payload": {...}
+    "payload": {...},
+    "secret": "shared-signing-secret"
   }'
 ```
 
-**Response (200):**
+**Response (201):** a `WebhookHistoryEntry` (see `/webhooks/history`). When a `secret` is in
+play, the entry carries the exact signing inputs:
+
 ```json
 {
-  "attemptId": "webhook-attempt-123",
-  "statusCode": 200,
-  "responseTime": 250
+  "id": "1f0c...",
+  "eventType": "transaction.submitted",
+  "endpointUrl": "https://example.com/webhook",
+  "method": "POST",
+  "requestHeaders": {
+    "Content-Type": "application/json",
+    "X-Webhook-Event": "transaction.submitted",
+    "X-SaviTools-Signature": "[REDACTED]",
+    "X-SaviTools-Timestamp": "1717243200"
+  },
+  "payload": {...},
+  "signature": {
+    "timestamp": "1717243200",
+    "body": "{\"event\":\"transaction.submitted\"}",
+    "signature": "sha256=8fdd98..."
+  },
+  "responseStatus": 200,
+  "latencyMs": 250
 }
 ```
 
+`signature.body` is byte-for-byte the request body that was sent and signed, so a receiver (or
+the Webhook Tester UI) can recompute the identical HMAC from `signature.timestamp` and
+`signature.body` without guessing the serialisation. The signature value in
+`requestHeaders` is redacted before storage; `signature.signature` carries the value that went
+on the wire.
+
 **Errors:**
-- `400`: Invalid webhook payload
+- `400`: Invalid webhook payload or an unsafe destination
+- `502`: Request payload exceeds the size limit, or the destination failed
 
 ---
 
 #### GET `/webhooks/history`
 
-Get the last 50 webhook send attempts.
+Get the last 50 webhook send attempts. Requires authentication.
 
 **Request:**
 ```bash
-curl http://localhost:3001/api/v1/webhooks/history
+curl http://localhost:3001/api/v1/webhooks/history \
+  --cookie "savitools_access_token=YOUR_ACCESS_TOKEN"
 ```
 
 **Response (200):**
 ```json
-{
-  "attempts": [
-    {
-      "id": "webhook-attempt-123",
-      "eventType": "transaction.submitted",
-      "url": "https://example.com/webhook",
-      "statusCode": 200,
-      "timestamp": "2024-06-21T12:34:56Z"
-    }
-  ]
-}
+[
+  {
+    "id": "1f0c...",
+    "eventType": "transaction.submitted",
+    "endpointUrl": "https://example.com/webhook",
+    "method": "POST",
+    "requestHeaders": {"X-SaviTools-Timestamp": "1717243200"},
+    "payload": {...},
+    "statusCode": 200,
+    "responseStatus": 200,
+    "responseBody": "ok",
+    "latencyMs": 250,
+    "timestamp": 1717243200000
+  }
+]
 ```
+
+Entries recorded under the legacy body-only signing format are returned with
+`"legacySignature": true`.
 
 ---
 
 #### POST `/webhooks/replay/:id`
 
-Replay a previous webhook send attempt.
+Replay a previous webhook send attempt. Requires authentication.
+
+The stored secret-shaped headers are redacted and cannot be reconstructed, so the replay is
+signed afresh with the deployment-wide `WEBHOOK_SIGNING_SECRET` (or sent unsigned if none is
+configured). Any recorded signing header is dropped first, so the replay never carries a
+timestamp that disagrees with the signature beside it.
 
 **Request:**
 ```bash
-curl -X POST http://localhost:3001/api/v1/webhooks/replay/webhook-attempt-123
+curl -X POST http://localhost:3001/api/v1/webhooks/replay/1f0c... \
+  --cookie "savitools_access_token=YOUR_ACCESS_TOKEN"
 ```
 
-**Response (200):**
-```json
-{
-  "attemptId": "webhook-attempt-456",
-  "statusCode": 200,
-  "responseTime": 275
-}
-```
+**Response (201):** a new `WebhookHistoryEntry`, as returned by `/webhooks/send`.
 
 **Errors:**
 - `404`: Webhook attempt not found

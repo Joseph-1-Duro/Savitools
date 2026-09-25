@@ -25,6 +25,13 @@ const CONTRACT_ID = 'CA3D5KRYM6CB7OWQ6TWYRR3Z4T7GNZLKERYNZGGA5SOAOPIFY6YQGAXE';
 const OTHER_CONTRACT = 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC';
 const SECRET = 'shhh-this-is-a-secret';
 
+/** Same known answer as the Webhook Tester and monitor delivery specs. */
+const KAT_SECRET = 'whsec_test-secret-123';
+const KAT_BODY = JSON.stringify({ id: 'evt-1', value: 1 });
+const KAT_TIMESTAMP = 1_700_000_000;
+const KAT_SIGNATURE =
+  'sha256=12fe4dba685452576f41ccde070a2c5f2e213fee2a66ad5b38ce628c2de9953b';
+
 function eventRecord(overrides: Partial<rpc.Api.EventResponse> = {}): rpc.Api.EventResponse {
   return {
     id: 'evt-1',
@@ -410,6 +417,48 @@ describe('EventsService', () => {
 
       const init = fetchMock.mock.calls[0][1] as RequestInit;
       expect(init.headers as Record<string, string>).not.toHaveProperty('X-SaviTools-Signature');
+    });
+
+    it('matches the known answer for a pinned clock', async () => {
+      // Same secret, body and timestamp as the other outbound paths' vectors,
+      // so all three must produce one signature for one body.
+      jest.useFakeTimers().setSystemTime(KAT_TIMESTAMP * 1000);
+      try {
+        const fetchMock = jest.fn().mockResolvedValue(textResponse(200));
+        global.fetch = fetchMock;
+
+        await service.replayEvents({
+          webhookUrl: 'https://example.com/hook',
+          secret: KAT_SECRET,
+          events: [{ id: 'evt-1', value: 1 }],
+        });
+
+        const init = fetchMock.mock.calls[0][1] as RequestInit;
+        const headers = init.headers as Record<string, string>;
+
+        expect(init.body).toBe(KAT_BODY);
+        expect(headers[TIMESTAMP_HEADER]).toBe(String(KAT_TIMESTAMP));
+        expect(headers[SIGNATURE_HEADER]).toBe(KAT_SIGNATURE);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('emits the SaviTools header pair and never the legacy one', async () => {
+      const fetchMock = jest.fn().mockResolvedValue(textResponse(200));
+      global.fetch = fetchMock;
+
+      await service.replayEvents({
+        webhookUrl: 'https://example.com/hook',
+        secret: SECRET,
+        events: [events[0]],
+      });
+
+      const headers = (fetchMock.mock.calls[0][1] as RequestInit).headers as Record<string, string>;
+      expect(headers).toHaveProperty(SIGNATURE_HEADER);
+      expect(headers).toHaveProperty(TIMESTAMP_HEADER);
+      expect(headers).not.toHaveProperty('X-Webhook-Signature');
+      expect(headers).not.toHaveProperty('X-Timestamp');
     });
 
     it('records a per-event failure without failing the batch', async () => {

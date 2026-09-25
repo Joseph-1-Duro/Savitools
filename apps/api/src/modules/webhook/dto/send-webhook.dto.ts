@@ -17,7 +17,12 @@ export class SendWebhookDto {
   @IsObject()
   payload?: Record<string, unknown>;
 
-  @ApiPropertyOptional({ description: 'Secret used to generate HMAC-SHA256 signature' })
+  @ApiPropertyOptional({
+    description:
+      'HMAC-SHA256 secret, defaulting to WEBHOOK_SIGNING_SECRET. When set, the request carries ' +
+      'X-SaviTools-Signature: sha256=<hex> and X-SaviTools-Timestamp: <unix seconds>, where the ' +
+      'hex is HMAC-SHA256 over the UTF-8 bytes of `<timestamp>.<body>`.',
+  })
   @IsOptional()
   @IsString()
   secret?: string;

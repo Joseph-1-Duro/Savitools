@@ -7,11 +7,7 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Job, Worker } from 'bullmq';
-import {
-  SIGNATURE_HEADER,
-  TIMESTAMP_HEADER,
-  signBody,
-} from '../webhook/signature';
+import { signatureHeaders } from '../webhook/signature';
 import { assertSafeWebhookDestination, MAX_WEBHOOK_REDIRECTS } from '../webhook/ssrf-guard';
 import { Resend } from 'resend';
 import { Repository } from 'typeorm';
@@ -229,11 +225,10 @@ export class NotificationWorkerService
       ruleId: alertEvent.ruleId,
       event: alertEvent.payload,
     });
-    // Same timestamped wire format as WebhookService and event replay.
-    const { signature, timestamp } = signBody({
-      secret,
-      body,
-    });
+    // Same timestamped wire format as WebhookService and event replay, and the
+    // signature pair is computed once so every redirect hop carries the
+    // timestamp the signature was made for.
+    const signedHeaders = signatureHeaders({ secret, body });
     let currentUrl = destination;
     let response: Response;
     for (let hop = 0; ; hop++) {
@@ -241,8 +236,7 @@ export class NotificationWorkerService
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          [SIGNATURE_HEADER]: signature,
-          [TIMESTAMP_HEADER]: timestamp,
+          ...signedHeaders,
         },
         body,
         redirect: 'manual',

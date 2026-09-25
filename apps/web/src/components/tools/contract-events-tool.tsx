@@ -405,7 +405,7 @@ function ReplayDialog({
               value={secret}
               onChange={(e) => setSecret(e.target.value)}
               type="password"
-              placeholder="Signs each POST as X-SaviTools-Signature"
+              placeholder="Signs each POST as X-SaviTools-Signature + X-SaviTools-Timestamp"
               className="rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none focus:border-primary"
             />
           </label>
